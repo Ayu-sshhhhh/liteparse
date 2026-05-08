@@ -46,6 +46,7 @@ interface ScreenshotCommandOptions {
   dpi?: string;
   format?: string;
   password?: string;
+  experimental?: boolean;
   config?: string;
   quiet?: boolean;
 }
@@ -234,6 +235,7 @@ program
   .option("--dpi <dpi>", "DPI for rendering", DEFAULT_DPI.toString())
   .option("--format <format>", "Image format: png|jpg", DEFAULT_SCREENSHOT_FORMAT)
   .option("--password <password>", "Password for encrypted/protected documents")
+  .option("--experimental", "Use experimental Rust-based PDF engine")
   .option("--config <file>", "Config file (JSON)")
   .option("-q, --quiet", "Suppress progress output")
   .action(async (file: string, options: ScreenshotCommandOptions) => {
@@ -263,6 +265,7 @@ program
         ...config,
         dpi: parseInt(options.dpi || DEFAULT_DPI.toString()),
         password: options.password,
+        experimental: options.experimental || false,
       };
 
       // Parse target pages

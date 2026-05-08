@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5.55", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 pdfium = { path = "../pdfium" }
 pdfium-sys = { path = "../pdfium-sys" }
 serde = { version = "1.0.228", features = ["derive"] }

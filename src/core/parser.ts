@@ -319,8 +319,12 @@ export class LiteParse {
     const results: ScreenshotResult[] = [];
     const pages = pageNumbers || Array.from({ length: totalPages }, (_, i) => i + 1);
 
-    const renderer = new PdfiumRenderer();
-    await renderer.loadDocument(pdfInput, this.config.password);
+    const useRustRenderer = this.config.experimental && this.pdfEngine instanceof LiteParseRsEngine;
+
+    const renderer = useRustRenderer ? null : new PdfiumRenderer();
+    if (renderer) {
+      await renderer.loadDocument(pdfInput, this.config.password);
+    }
 
     try {
       for (const pageNum of pages) {
@@ -330,7 +334,10 @@ export class LiteParse {
         }
 
         log(`Rendering page ${pageNum}...`);
-        const imageBuffer = await renderer.renderPageToBuffer(pdfInput, pageNum, this.config.dpi);
+
+        const imageBuffer = useRustRenderer
+          ? await this.pdfEngine.renderPageImage(doc, pageNum, this.config.dpi, this.config.password)
+          : await renderer!.renderPageToBuffer(pdfInput, pageNum, this.config.dpi);
 
         const pageData = await this.pdfEngine.extractPage(doc, pageNum, { extractImages: false });
 
@@ -342,7 +349,9 @@ export class LiteParse {
         });
       }
     } finally {
-      await renderer.close();
+      if (renderer) {
+        await renderer.close();
+      }
       await this.pdfEngine.close(doc);
 
       if (needsCleanup && cleanupPath) {

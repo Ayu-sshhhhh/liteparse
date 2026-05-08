@@ -148,12 +148,31 @@ export class LiteParseRsEngine implements PdfEngine {
 
   async renderPageImage(
     _doc: PdfDocument,
-    _pageNum: number,
-    _dpi: number,
+    pageNum: number,
+    dpi: number,
     _password?: string
   ): Promise<Buffer> {
-    // TODO: implement page rendering in the Rust CLI
-    throw new Error("renderPageImage is not yet implemented in liteparse-rs");
+    const rustDoc = _doc as RustPdfDocument;
+    const args = [
+      "screenshot-stdout",
+      "--pdf-path",
+      rustDoc._filePath,
+      "--page-num",
+      String(pageNum),
+      "--dpi",
+      String(dpi),
+    ];
+
+    try {
+      const result = await execFileAsync(BINARY_PATH, args, {
+        maxBuffer: 100 * 1024 * 1024, // 100 MB
+        encoding: "buffer" as BufferEncoding,
+      });
+      return Buffer.from(result.stdout as unknown as Buffer);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`liteparse-rs screenshot failed: ${message}`);
+    }
   }
 
   async close(_doc: PdfDocument): Promise<void> {

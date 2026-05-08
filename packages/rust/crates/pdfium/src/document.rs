@@ -17,6 +17,7 @@ impl Document {
         }
         Ok(Page {
             handle,
+            doc_handle: self.handle,
             _doc: std::marker::PhantomData,
         })
     }

@@ -1,11 +1,23 @@
 use std::marker::PhantomData;
 
+use crate::bitmap::Bitmap;
 use crate::document::Document;
 use crate::error::PdfiumError;
 use crate::text_page::TextPage;
 
+/// Bounding box of an embedded image object on a page.
+/// Coordinates are in PDF points with top-left origin (Y-down).
+#[derive(Debug, Clone, Copy)]
+pub struct ImageBounds {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 pub struct Page<'doc> {
     pub(crate) handle: pdfium_sys::FPDF_PAGE,
+    pub(crate) doc_handle: pdfium_sys::FPDF_DOCUMENT,
     pub(crate) _doc: PhantomData<&'doc Document>,
 }
 
@@ -31,6 +43,121 @@ impl Page<'_> {
             handle,
             _page: PhantomData,
         })
+    }
+
+    /// Render the page to a BGRA bitmap at the given DPI.
+    pub fn render(&self, dpi: f32) -> Result<Bitmap, PdfiumError> {
+        let scale = dpi / 72.0;
+        let width = (self.width() * scale).round() as i32;
+        let height = (self.height() * scale).round() as i32;
+
+        let bitmap = Bitmap::new(width, height)?;
+
+        // Fill with white (ARGB: 0xFFFFFFFF)
+        bitmap.fill_rect(0, 0, width, height, 0xFFFFFFFF);
+
+        let flags = (pdfium_sys::FPDF_ANNOT | pdfium_sys::FPDF_PRINTING) as i32;
+
+        unsafe {
+            pdfium_sys::FPDF_RenderPageBitmap(
+                bitmap.handle(),
+                self.handle,
+                0,      // start_x
+                0,      // start_y
+                width,  // size_x
+                height, // size_y
+                0,      // rotation
+                flags,
+            );
+        }
+
+        Ok(bitmap)
+    }
+
+    /// Extract bounding boxes of embedded image objects on this page.
+    /// Returns coordinates in viewport space (Y-down, top-left origin) in PDF points.
+    /// Filters out images smaller than `min_size_pt` and images covering more than
+    /// `max_page_coverage` fraction of the page.
+    pub fn image_bounds(&self, min_size_pt: f32, max_page_coverage: f32) -> Vec<ImageBounds> {
+        let page_width = self.width();
+        let page_height = self.height();
+        let obj_count = unsafe { pdfium_sys::FPDFPage_CountObjects(self.handle) };
+        let mut results = Vec::new();
+
+        for i in 0..obj_count {
+            let obj = unsafe { pdfium_sys::FPDFPage_GetObject(self.handle, i) };
+            if obj.is_null() {
+                continue;
+            }
+
+            let obj_type = unsafe { pdfium_sys::FPDFPageObj_GetType(obj) };
+            if obj_type != pdfium_sys::FPDF_PAGEOBJ_IMAGE as i32 {
+                continue;
+            }
+
+            let mut left: f32 = 0.0;
+            let mut bottom: f32 = 0.0;
+            let mut right: f32 = 0.0;
+            let mut top: f32 = 0.0;
+            let ok = unsafe {
+                pdfium_sys::FPDFPageObj_GetBounds(obj, &mut left, &mut bottom, &mut right, &mut top)
+            };
+            if ok == 0 {
+                continue;
+            }
+
+            let w = right - left;
+            let h = top - bottom;
+
+            if w < min_size_pt || h < min_size_pt {
+                continue;
+            }
+            if w > page_width * max_page_coverage && h > page_height * max_page_coverage {
+                continue;
+            }
+
+            // Convert from PDF coords (bottom-left origin) to viewport (top-left origin)
+            results.push(ImageBounds {
+                x: left,
+                y: page_height - top,
+                width: w,
+                height: h,
+            });
+        }
+
+        results
+    }
+
+    /// Get the rendered bitmap of a specific embedded image object by index.
+    /// The index corresponds to the order from iterating page objects (image objects only).
+    pub fn render_image_object(&self, image_obj_index: usize) -> Result<Bitmap, PdfiumError> {
+        let obj_count = unsafe { pdfium_sys::FPDFPage_CountObjects(self.handle) };
+        let mut image_idx = 0usize;
+
+        for i in 0..obj_count {
+            let obj = unsafe { pdfium_sys::FPDFPage_GetObject(self.handle, i) };
+            if obj.is_null() {
+                continue;
+            }
+            let obj_type = unsafe { pdfium_sys::FPDFPageObj_GetType(obj) };
+            if obj_type != pdfium_sys::FPDF_PAGEOBJ_IMAGE as i32 {
+                continue;
+            }
+
+            if image_idx == image_obj_index {
+                let bmp_handle = unsafe {
+                    pdfium_sys::FPDFImageObj_GetRenderedBitmap(self.doc_handle, self.handle, obj)
+                };
+                if bmp_handle.is_null() {
+                    return Err(PdfiumError::OperationFailed);
+                }
+                // Wrap in our Bitmap (which will call Destroy on drop)
+                return Ok(unsafe { Bitmap::from_handle(bmp_handle) });
+            }
+            image_idx += 1;
+        }
+
+        Err(PdfiumError::OperationFailed)
     }
 }
 

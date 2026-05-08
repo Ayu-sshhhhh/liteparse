@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand, Args};
 use liteparse_rs::extract;
 use liteparse_rs::projection;
+use liteparse_rs::render;
 
 
 #[derive(Parser, Debug)]
@@ -16,6 +17,12 @@ enum Commands {
     Extract(PdfCommand),
     /// Parse a PDF file: extract + grid projection, output projected pages as JSON
     Parse(PdfCommand),
+    /// Render a page to a PNG screenshot (file output)
+    Screenshot(ScreenshotCommand),
+    /// Render a page to PNG and write to stdout
+    ScreenshotStdout(ScreenshotStdoutCommand),
+    /// Extract embedded image bounding boxes from a page
+    ImageBounds(PdfCommand),
 }
 
 
@@ -28,6 +35,40 @@ struct PdfCommand {
     /// Optionally specify a target page number
     #[arg(long)]
     page_num: Option<u32>,
+}
+
+#[derive(Args, Debug)]
+struct ScreenshotCommand {
+    /// Specify the path to the PDF file
+    #[arg(long)]
+    pdf_path: String,
+
+    /// Target page number (1-based)
+    #[arg(long)]
+    page_num: u32,
+
+    /// Output PNG file path
+    #[arg(long)]
+    output: String,
+
+    /// DPI for rendering (default: 150)
+    #[arg(long, default_value = "150")]
+    dpi: f32,
+}
+
+#[derive(Args, Debug)]
+struct ScreenshotStdoutCommand {
+    /// Specify the path to the PDF file
+    #[arg(long)]
+    pdf_path: String,
+
+    /// Target page number (1-based)
+    #[arg(long)]
+    page_num: u32,
+
+    /// DPI for rendering (default: 150)
+    #[arg(long, default_value = "150")]
+    dpi: f32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -53,6 +94,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 t3.duration_since(t2).as_secs_f64() * 1000.0,
                 t3.duration_since(t0).as_secs_f64() * 1000.0,
             );
+        }
+        Commands::Screenshot(cmd) => {
+            render::screenshot(&cmd.pdf_path, cmd.page_num, cmd.dpi, &cmd.output)?;
+        }
+        Commands::ScreenshotStdout(cmd) => {
+            render::screenshot_to_stdout(&cmd.pdf_path, cmd.page_num, cmd.dpi)?;
+        }
+        Commands::ImageBounds(cmd) => {
+            render::image_bounds(&cmd.pdf_path, cmd.page_num)?;
         }
     }
 
