@@ -4,11 +4,28 @@ use crate::types::*;
 const FLOATING_SPACES: usize = 2;
 const COLUMN_SPACES: usize = 4;
 
+// Flowing text detection constants
+const FLOWING_MAX_TOTAL_ANCHORS: usize = 4;
+const FLOWING_MAX_LEFT_ANCHORS: usize = 3;
+const FLOWING_MIN_LINES: usize = 3;
+const FLOWING_WIDE_LINE_RATIO: f32 = 0.5;
+const FLOWING_WIDE_LINE_THRESHOLD: f32 = 0.6;
+const FLOWING_COLUMN_GAP_MULTIPLIER: f32 = 4.0;
+const FLOWING_MIN_LINE_ITEMS: usize = 3;
+const FLOWING_SPACE_HEIGHT_RATIO: f32 = 0.15;
+const FLOWING_SPACE_MIN_THRESHOLD: f32 = 0.3;
+const FLOWING_MAX_INDENT: usize = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SnapKind {
     Left,
     Right,
     Center,
+}
+
+struct LineRange {
+    start: usize,
+    end: usize,
 }
 
 fn compute_median_textbox_size(items: &[ProjectedTextItem]) -> (f32, f32) {
@@ -50,15 +67,15 @@ fn compute_median_textbox_size(items: &[ProjectedTextItem]) -> (f32, f32) {
 
     widths.sort_by(|a, b| a.total_cmp(b));
     heights.sort_by(|a, b| a.total_cmp(b));
-    
+
     let mid = widths.len() / 2;
-    
+
     let median_width = if widths.len().is_multiple_of(2) {
         (widths[mid - 1] + widths[mid]) / 2.0
     } else {
         widths[mid]
     };
-    
+
     let median_height = if heights.len().is_multiple_of(2) {
         (heights[mid - 1] + heights[mid]) / 2.0
     } else {
@@ -321,18 +338,9 @@ fn form_lines(
     page_width: f32,
 ) -> Vec<Vec<ProjectedTextItem>> {
     // Y-tolerance for sorting: items within this threshold are considered same line
-    // This handles:
-    // 1. Floating point precision issues between columns (e.g., 334.7400 vs 334.7399)
-    // 2. Subscripts/superscripts which are typically offset by 3-5 units from their base characters
-    // Using a fraction of medianHeight to scale with document font size.
     let y_sort_tolerance: f32 = (median_height * 0.5).max(5.0);
-    
-    // Note: We keep whitespace items as they may be needed for proper word separation.
-    // The spacing calculation handles gaps between items.
 
     // For two-column documents, detect and mark margin line numbers
-    // These are short numeric items positioned between columns (near the page midpoint)
-    // They should not be merged with column content
     if page_width > 0.0 {
         let midpoint = page_width / 2.0;
         let margin_left = midpoint - 5.0;
@@ -364,11 +372,10 @@ fn form_lines(
         for item in items.iter_mut() {
             let center = item.item.x + item.item.width / 2.0;
 
-            // Check if item is in the margin zone and looks like a number
             if center > margin_left &&
                center < margin_right &&
                is_margin_line_number_text(&item.item.text) &&
-               item.item.width < 15.0 
+               item.item.width < 15.0
             {
                 item.is_margin_line_number = true;
             }
@@ -376,8 +383,7 @@ fn form_lines(
     }
 
     // Sort by y then x. Snap y to a grid so items on the same visual line
-    // get identical keys — this keeps the comparator transitive (total order),
-    // which Rust's sort requires.
+    // get identical keys — this keeps the comparator transitive (total order).
     let snap_y = |y: f32| -> i64 {
         if y_sort_tolerance > 0.0 {
             (y / y_sort_tolerance).round() as i64
@@ -410,7 +416,6 @@ fn form_lines(
     }
 
     // Merge continuous bbox items in a single linear pass.
-    // This avoids repeated middle removals (O(n^2) in worst case) on large OCR outputs.
     let merge_y_tolerance = 0.1;
     let merge_h_tolerance = 0.1;
 
@@ -448,11 +453,6 @@ fn form_lines(
             for line_item in current_line.iter() {
                 let overlap_length = (line_item.item.x + line_item.item.width).min(item.item.x + item.item.width) - line_item.item.x.max(item.item.x);
 
-                // Use a minimum threshold to tolerate small overalps common in PDFs due to:
-                // - character spacing and kerning
-                // - floating point precision issues in text extraction
-                // - adjacent items with slightly overlapping boxes
-                // We want to detect true collisions, not adjacent text
                 if overlap_length > f32::max(5.0, median_width / 3.0) {
                     line_collide = true;
                     break;
@@ -473,12 +473,12 @@ fn form_lines(
             let y_within_tolerance =
                 item.rotated && (item.item.y - current_line_min_y).abs() < y_tolerance_merge;
 
-            if !line_collide && !margin_mismatch && 
+            if !line_collide && !margin_mismatch &&
                 (
-                    y_within_tolerance || 
-                    (item.item.y + item.item.height * 0.5 >= current_line_min_y && item.item.y + item.item.height * 0.5 <= current_line_max_y) || 
+                    y_within_tolerance ||
+                    (item.item.y + item.item.height * 0.5 >= current_line_min_y && item.item.y + item.item.height * 0.5 <= current_line_max_y) ||
                     (item.item.y >= current_line_min_y && item.item.y <= current_line_max_y)
-                ) 
+                )
             {
                 current_line_min_y = current_line_min_y.min(item.item.y);
                 current_line_max_y = current_line_max_y.max(item.item.y + item.item.height);
@@ -515,8 +515,6 @@ fn form_lines(
     // merge 'words'
     const MERGE_THRESHOLD: f32 = 1.0;
 
-    // Pattern to detect standalone numeric values.
-    // Matches: numbers with optional commas, decimal points, dollar signs, percentages, negatives.
     fn looks_like_table_number(text: &str) -> bool {
         let trimmed = text.trim();
         if trimmed.chars().count() < 2 {
@@ -544,7 +542,6 @@ fn form_lines(
                 }
                 has_decimal = true;
             } else if c == '%' {
-                // Percent is only valid as trailing char.
                 return has_digit && trimmed.ends_with('%');
             } else {
                 return false;
@@ -645,8 +642,6 @@ fn form_lines(
     }
 
     // Insert blank lines for vertical gaps between lines.
-    // Uses the same approach as TS: if the gap between two lines exceeds
-    // a reference height, insert proportional blank lines.
     let mut i = 1;
     while i < lines.len() {
         let prev_metrics = representative_line_metrics(&lines[i - 1], median_height);
@@ -866,54 +861,58 @@ fn fix_sparse_blocks(raw_lines: &mut [String], start: usize, end: usize) {
     }
 }
 
-fn project_to_grid(page: &Page, mut projection_boxes: Vec<ProjectedTextItem>) -> (Vec<ProjectedTextItem>, String) {
-    // Step 1a: Filter out items that are purely dots
-    let mut dot_count = 0usize;
-    projection_boxes.iter().for_each(|item| {
-        if item.item.text.chars().all(|c| c == '.' || c == '·' || c == '•') {
-            dot_count += 1;
+// ---------------------------------------------------------------------------
+// Block segmentation & flowing text detection
+// ---------------------------------------------------------------------------
+
+/// Segments page lines into blocks separated by double blank lines.
+fn segment_blocks(lines: &[Vec<ProjectedTextItem>]) -> Vec<LineRange> {
+    let mut blocks = Vec::new();
+    let mut empty_count = 0usize;
+    let mut start: Option<usize> = None;
+
+    for (line_idx, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            empty_count += 1;
+            if empty_count > 1 {
+                if let Some(s) = start {
+                    // Include the trailing double-blank at the end of the block
+                    blocks.push(LineRange { start: s, end: line_idx + 1 });
+                }
+                start = None;
+            }
+        } else {
+            empty_count = 0;
+            if start.is_none() {
+                start = Some(line_idx);
+            }
         }
-    });
-
-    // If there are many dot-only items (likely a dotted ruler), remove them in-place.
-    // Use a relative threshold (5%) and an absolute threshold (100) to avoid removing
-    // dots on small pages.
-    if dot_count > 100 && (dot_count as f64) > (projection_boxes.len() as f64) * 0.05 {
-        projection_boxes.retain(|item| {
-            !item.item.text.chars().all(|c| c == '.' || c == '·' || c == '•')
-        });
     }
 
-    // Step 1b: Round dimensions (matching TS buildBbox Math.round on w/h)
-    for item in projection_boxes.iter_mut() {
-        item.item.width = item.item.width.round();
-        item.item.height = item.item.height.round();
+    if let Some(s) = start {
+        blocks.push(LineRange { start: s, end: lines.len() });
     }
 
-    // Step 1c: Compute median distances
-    let (median_width, median_height) = compute_median_textbox_size(&projection_boxes);
-
-    // Step 1c: Handle reading order rotations
-    handle_rotation_reading_order(&mut projection_boxes, page.page_height);
-
-    // Step 1d: Form lines of boxes
-    let mut lines = form_lines(&mut projection_boxes, median_width, median_height, page.page_width);
-    if lines.is_empty() {
-        return (Vec::new(), String::new());
+    // If no blocks found, treat entire page as one block
+    if blocks.is_empty() && !lines.is_empty() {
+        blocks.push(LineRange { start: 0, end: lines.len() });
     }
 
-    let mut meta: Vec<Vec<BoxMeta>> = lines
-        .iter()
-        .map(|line| vec![BoxMeta::default(); line.len()])
-        .collect();
+    blocks
+}
 
-    // Anchor extraction
+/// Extract anchor maps for a single block of lines.
+/// Returns (anchor_left, anchor_right, anchor_center) with absolute line indices.
+fn extract_block_anchors(
+    lines: &[Vec<ProjectedTextItem>],
+    block: &LineRange,
+) -> (HashMap<i32, Vec<(usize, usize)>>, HashMap<i32, Vec<(usize, usize)>>, HashMap<i32, Vec<(usize, usize)>>) {
     let mut anchor_left: HashMap<i32, Vec<(usize, usize)>> = HashMap::new();
     let mut anchor_right: HashMap<i32, Vec<(usize, usize)>> = HashMap::new();
     let mut anchor_center: HashMap<i32, Vec<(usize, usize)>> = HashMap::new();
 
-    for (line_idx, line) in lines.iter().enumerate() {
-        for (box_idx, bbox) in line.iter().enumerate() {
+    for line_idx in block.start..block.end {
+        for (box_idx, bbox) in lines[line_idx].iter().enumerate() {
             let left_key = anchor_key(bbox.item.x);
             let right_key = anchor_key(bbox.item.x + bbox.item.width);
             let center_key = anchor_key(bbox.item.x + bbox.item.width * 0.5);
@@ -923,207 +922,879 @@ fn project_to_grid(page: &Page, mut projection_boxes: Vec<ProjectedTextItem>) ->
         }
     }
 
-    merge_nearby_anchor_groups(&mut anchor_left);
-    merge_nearby_anchor_groups(&mut anchor_right);
-    merge_nearby_anchor_groups(&mut anchor_center);
+    (anchor_left, anchor_right, anchor_center)
+}
 
-    // Keep non-singletons only.
-    anchor_left.retain(|_, v| v.len() >= 2);
-    anchor_right.retain(|_, v| v.len() >= 2);
-    anchor_center.retain(|_, v| v.len() >= 2);
+/// Remove vertically isolated items from anchor groups.
+/// Items must have a neighbor within `page_height * delta` to survive.
+fn delta_min_filter(
+    collection: &mut HashMap<i32, Vec<(usize, usize)>>,
+    lines: &[Vec<ProjectedTextItem>],
+    page_height: f32,
+    delta: f32,
+) {
+    let max_delta = page_height * delta;
 
-    // Populate per-item anchor candidates.
-    for (anchor, members) in &anchor_left {
-        for (li, bi) in members {
-            meta[*li][*bi].left_anchor = Some(*anchor);
+    for members in collection.values_mut() {
+        // Sort members by y coordinate
+        members.sort_by(|a, b| {
+            let ya = lines[a.0][a.1].item.y;
+            let yb = lines[b.0][b.1].item.y;
+            ya.total_cmp(&yb)
+        });
+
+        let mut keep = vec![false; members.len()];
+        for i in 0..members.len() {
+            let y_cur = lines[members[i].0][members[i].1].item.y;
+            if i > 0 {
+                let y_prev = lines[members[i - 1].0][members[i - 1].1].item.y;
+                if y_cur - y_prev < max_delta {
+                    keep[i] = true;
+                    keep[i - 1] = true;
+                }
+            }
+            if i + 1 < members.len() {
+                let y_next = lines[members[i + 1].0][members[i + 1].1].item.y;
+                if y_next - y_cur < max_delta {
+                    keep[i] = true;
+                }
+            }
         }
-    }
-    for (anchor, members) in &anchor_right {
-        for (li, bi) in members {
-            meta[*li][*bi].right_anchor = Some(*anchor);
-        }
-    }
-    for (anchor, members) in &anchor_center {
-        for (li, bi) in members {
-            meta[*li][*bi].center_anchor = Some(*anchor);
-        }
+
+        let mut idx = 0;
+        members.retain(|_| {
+            let k = keep[idx];
+            idx += 1;
+            k
+        });
     }
 
-    // Resolve duplicates by choosing strongest anchor (tie-break: left > right > center).
-    for line_idx in 0..lines.len() {
-        for box_idx in 0..lines[line_idx].len() {
-            let left_count = meta[line_idx][box_idx]
-                .left_anchor
-                .and_then(|k| anchor_left.get(&k).map(|v| v.len()))
-                .unwrap_or(0);
-            let right_count = meta[line_idx][box_idx]
-                .right_anchor
-                .and_then(|k| anchor_right.get(&k).map(|v| v.len()))
-                .unwrap_or(0);
-            let center_count = meta[line_idx][box_idx]
-                .center_anchor
-                .and_then(|k| anchor_center.get(&k).map(|v| v.len()))
-                .unwrap_or(0);
+    collection.retain(|_, v| !v.is_empty());
+}
 
-            if left_count == 0 && right_count == 0 && center_count == 0 {
-                continue;
+/// Remove anchors where text from other items visually crosses the anchor x-position
+/// between every consecutive pair of anchor members.
+fn intercept_filter(
+    collection: &mut HashMap<i32, Vec<(usize, usize)>>,
+    lines: &[Vec<ProjectedTextItem>],
+) {
+    let anchors_to_remove: Vec<i32> = collection
+        .iter()
+        .filter_map(|(anchor_key_val, members)| {
+            if members.len() < 2 {
+                return None;
             }
 
-            let kind = if left_count >= right_count && left_count >= center_count {
-                SnapKind::Left
-            } else if right_count >= left_count && right_count >= center_count {
-                SnapKind::Right
+            let anchor_x = anchor_to_x(*anchor_key_val);
+            let mut any_pair_clear = false;
+
+            for i in 1..members.len() {
+                let y1 = lines[members[i - 1].0][members[i - 1].1].item.y;
+                let y2 = lines[members[i].0][members[i].1].item.y;
+                let (y_min, y_max) = if y1 < y2 { (y1, y2) } else { (y2, y1) };
+
+                let mut intercepted = false;
+                for line in lines.iter() {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let line_y = line[0].item.y;
+                    if line_y > y_min && line_y < y_max {
+                        for item in line {
+                            if item.item.x < anchor_x && item.item.x + item.item.width > anchor_x {
+                                intercepted = true;
+                                break;
+                            }
+                        }
+                        if intercepted {
+                            break;
+                        }
+                    }
+                }
+
+                if !intercepted {
+                    any_pair_clear = true;
+                    break;
+                }
+            }
+
+            if !any_pair_clear {
+                Some(*anchor_key_val)
             } else {
-                SnapKind::Center
-            };
-            meta[line_idx][box_idx].snap = Some(kind);
-        }
-    }
+                None
+            }
+        })
+        .collect();
 
-    // Compute spacing hints between neighboring boxes (after snaps are assigned).
-    for line_idx in 0..lines.len() {
+    for key in anchors_to_remove {
+        collection.remove(&key);
+    }
+}
+
+/// Build a set of all (line_idx, box_idx) pairs present in any anchor map.
+fn anchored_items_set(
+    anchor_left: &HashMap<i32, Vec<(usize, usize)>>,
+    anchor_right: &HashMap<i32, Vec<(usize, usize)>>,
+    anchor_center: &HashMap<i32, Vec<(usize, usize)>>,
+) -> HashSet<(usize, usize)> {
+    let mut set = HashSet::new();
+    for members in anchor_left.values() {
+        for m in members { set.insert(*m); }
+    }
+    for members in anchor_right.values() {
+        for m in members { set.insert(*m); }
+    }
+    for members in anchor_center.values() {
+        for m in members { set.insert(*m); }
+    }
+    set
+}
+
+/// Try to align floating bboxes (not in any surviving anchor) to nearby anchors
+/// on adjacent lines within the given margin.
+fn try_align_floating(
+    target: &mut HashMap<i32, Vec<(usize, usize)>>,
+    lines: &[Vec<ProjectedTextItem>],
+    block: &LineRange,
+    anchored: &HashSet<(usize, usize)>,
+    margin: f32,
+    ref_x_fn: fn(&TextItem) -> f32,
+    anchor_key_fn: fn(&TextItem) -> i32,
+) {
+    let mut additions: Vec<(i32, (usize, usize))> = Vec::new();
+
+    for line_idx in block.start..block.end {
         for box_idx in 0..lines[line_idx].len() {
-            if box_idx == 0 {
-                meta[line_idx][box_idx].should_space = 0;
+            if anchored.contains(&(line_idx, box_idx)) {
                 continue;
             }
-            let prev = &lines[line_idx][box_idx - 1].item;
-            let cur = &lines[line_idx][box_idx].item;
-            let x_delta = cur.x - (prev.x + prev.width);
 
-            let mut should_space = 0usize;
-            if x_delta > 2.0 {
-                should_space = 1;
-                let prev_len = prev.text.chars().count().max(1) as f32;
-                let prev_char_width = (prev.width / prev_len).max(0.1);
-                if x_delta > prev_char_width * 2.0 {
-                    let column_gap_threshold = page.page_width * 0.1;
-                    let same_column = x_delta < column_gap_threshold;
+            let ref_x = ref_x_fn(&lines[line_idx][box_idx].item);
 
-                    let cur_snap = meta[line_idx][box_idx].snap;
-                    let prev_snap = meta[line_idx][box_idx - 1].snap;
-                    let cur_is_left_snap = cur_snap == Some(SnapKind::Left);
-                    let prev_is_right_snap = prev_snap == Some(SnapKind::Right);
-                    let both_snapped = cur_snap.is_some() && prev_snap.is_some();
-                    let force_unsnapped = meta[line_idx][box_idx].force_unsnapped;
+            // Check adjacent lines for candidate anchors
+            let mut candidate_anchor: Option<i32> = None;
+            let mut prev_diff = margin + 1.0;
 
-                    if (!force_unsnapped && x_delta > prev_char_width * 8.0)
-                        || cur_is_left_snap
-                        || prev_is_right_snap
-                        || both_snapped
-                    {
-                        should_space = if same_column { FLOATING_SPACES } else { COLUMN_SPACES };
-                    } else {
-                        should_space = if same_column { 1 } else { FLOATING_SPACES };
+            let adj_lines: [Option<usize>; 2] = [
+                if line_idx > block.start { Some(line_idx - 1) } else { None },
+                if line_idx + 1 < block.end { Some(line_idx + 1) } else { None },
+            ];
+
+            for adj_opt in &adj_lines {
+                let Some(adj_line_idx) = adj_opt else { continue };
+                for adj_box_idx in 0..lines[*adj_line_idx].len() {
+                    let cand_key = anchor_key_fn(&lines[*adj_line_idx][adj_box_idx].item);
+                    if !target.contains_key(&cand_key) {
+                        continue;
+                    }
+                    let x_diff = (anchor_to_x(cand_key) - ref_x).abs();
+                    if x_diff <= margin && x_diff < prev_diff {
+                        candidate_anchor = Some(cand_key);
+                        prev_diff = x_diff;
                     }
                 }
             }
-            meta[line_idx][box_idx].should_space = should_space;
-        }
-    }
 
-    let mut left_snaps: Vec<i32> = anchor_left.keys().copied().collect();
-    let mut right_snaps: Vec<i32> = anchor_right.keys().copied().collect();
-    let mut center_snaps: Vec<i32> = anchor_center.keys().copied().collect();
-    left_snaps.sort_unstable();
-    right_snaps.sort_unstable();
-    center_snaps.sort_unstable();
-
-    let mut floating_set: HashSet<i32> = HashSet::new();
-    for (line_idx, line) in lines.iter().enumerate() {
-        for (box_idx, bbox) in line.iter().enumerate() {
-            if meta[line_idx][box_idx].snap.is_none() {
-                floating_set.insert(anchor_key(bbox.item.x));
+            if let Some(key) = candidate_anchor {
+                additions.push((key, (line_idx, box_idx)));
             }
         }
     }
-    let mut floating_snaps: Vec<i32> = floating_set.into_iter().collect();
-    floating_snaps.sort_unstable();
 
+    // Apply additions after iteration to avoid borrow conflicts
+    for (key, item) in additions {
+        if let Some(members) = target.get_mut(&key) {
+            if !members.contains(&item) {
+                members.push(item);
+            }
+        }
+    }
+}
+
+/// Maximum horizontal gap between consecutive items on a line.
+fn line_max_gap(line: &[ProjectedTextItem]) -> f32 {
+    let mut max_gap: f32 = 0.0;
+    for i in 1..line.len() {
+        let gap = line[i].item.x - (line[i - 1].item.x + line[i - 1].item.width);
+        if gap > max_gap {
+            max_gap = gap;
+        }
+    }
+    max_gap
+}
+
+/// Check if a block of lines is flowing paragraph text (vs structured/tabular).
+fn is_flowing_text_block(
+    lines: &[Vec<ProjectedTextItem>],
+    block: &LineRange,
+    anchor_left: &HashMap<i32, Vec<(usize, usize)>>,
+    anchor_right: &HashMap<i32, Vec<(usize, usize)>>,
+    anchor_center: &HashMap<i32, Vec<(usize, usize)>>,
+    page_width: f32,
+) -> bool {
+    let total_anchors = anchor_left.len() + anchor_right.len() + anchor_center.len();
+    if total_anchors > FLOWING_MAX_TOTAL_ANCHORS {
+        return false;
+    }
+    if anchor_left.len() > FLOWING_MAX_LEFT_ANCHORS {
+        return false;
+    }
+
+    let mut non_empty_lines = 0usize;
+    let mut wide_lines = 0usize;
+
+    for i in block.start..block.end {
+        let line = &lines[i];
+        if line.is_empty() {
+            continue;
+        }
+        non_empty_lines += 1;
+
+        let line_start = line[0].item.x;
+        let line_end = line.last().map(|b| b.item.x + b.item.width).unwrap_or(0.0);
+        if line_end - line_start > page_width * FLOWING_WIDE_LINE_RATIO {
+            wide_lines += 1;
+        }
+    }
+
+    if non_empty_lines < FLOWING_MIN_LINES {
+        return false;
+    }
+
+    (wide_lines as f32 / non_empty_lines as f32) > FLOWING_WIDE_LINE_THRESHOLD
+}
+
+/// Render a single line as flowing text with indentation.
+fn render_line_as_flowing_text(
+    line: &mut [ProjectedTextItem],
+    min_x: f32,
+    median_width: f32,
+    meta_line: &mut [BoxMeta],
+) -> String {
+    if line.is_empty() {
+        return String::new();
+    }
+
+    let indent = ((line[0].item.x - min_x) / median_width)
+        .round()
+        .max(0.0)
+        .min(FLOWING_MAX_INDENT as f32) as usize;
+
+    let mut result = " ".repeat(indent);
+
+    for i in 0..line.len() {
+        if i > 0 {
+            let prev = &line[i - 1].item;
+            let cur = &line[i].item;
+            let gap = cur.x - (prev.x + prev.width);
+            let space_threshold = (cur.height * FLOWING_SPACE_HEIGHT_RATIO).max(FLOWING_SPACE_MIN_THRESHOLD);
+            if gap > space_threshold && !result.ends_with(' ') {
+                result.push(' ');
+            }
+        }
+        result.push_str(&line[i].item.text);
+        meta_line[i].rendered = true;
+        line[i].rendered = true;
+    }
+
+    result
+}
+
+/// Render an entire block as flowing text (all lines).
+fn render_flowing_block(
+    lines: &mut [Vec<ProjectedTextItem>],
+    block: &LineRange,
+    raw_lines: &mut [String],
+    meta: &mut [Vec<BoxMeta>],
+    median_width: f32,
+) {
+    let mut min_x = f32::INFINITY;
+    for i in block.start..block.end {
+        if !lines[i].is_empty() {
+            min_x = min_x.min(lines[i][0].item.x);
+        }
+    }
+    if min_x == f32::INFINITY {
+        min_x = 0.0;
+    }
+
+    for line_idx in block.start..block.end {
+        if lines[line_idx].is_empty() {
+            continue;
+        }
+        raw_lines[line_idx] = render_line_as_flowing_text(
+            &mut lines[line_idx],
+            min_x,
+            median_width,
+            &mut meta[line_idx],
+        );
+    }
+}
+
+/// Per-line flowing detection within structured blocks.
+/// Identifies individual lines that should be rendered as flowing text.
+fn detect_and_render_flowing_lines(
+    lines: &mut [Vec<ProjectedTextItem>],
+    block: &LineRange,
+    raw_lines: &mut [String],
+    meta: &mut [Vec<BoxMeta>],
+    median_width: f32,
+    page_width: f32,
+) {
+    let column_gap_threshold = median_width * FLOWING_COLUMN_GAP_MULTIPLIER;
+
+    // Find block's left margin
+    let mut block_min_x = f32::INFINITY;
+    for li in block.start..block.end {
+        if !lines[li].is_empty() {
+            block_min_x = block_min_x.min(lines[li][0].item.x);
+        }
+    }
+    if block_min_x == f32::INFINITY {
+        block_min_x = 0.0;
+    }
+
+    let mut flowing_lines: HashSet<usize> = HashSet::new();
+
+    // First pass: detect clearly flowing lines (wide span, no column gaps, enough items)
+    for line_idx in block.start..block.end {
+        let line = &lines[line_idx];
+        if line.len() < FLOWING_MIN_LINE_ITEMS {
+            continue;
+        }
+
+        let line_start = line[0].item.x;
+        let line_end = line.last().map(|b| b.item.x + b.item.width).unwrap_or(0.0);
+        let line_span = line_end - line_start;
+
+        if line_span > page_width * FLOWING_WIDE_LINE_RATIO
+            && line_max_gap(line) < column_gap_threshold
+        {
+            flowing_lines.insert(line_idx);
+        }
+    }
+
+    // Forward sweep: propagate flowing status downward
+    for line_idx in block.start..block.end {
+        if flowing_lines.contains(&line_idx) || lines[line_idx].is_empty() {
+            continue;
+        }
+        if line_idx > block.start
+            && flowing_lines.contains(&(line_idx - 1))
+            && line_max_gap(&lines[line_idx]) < column_gap_threshold
+        {
+            flowing_lines.insert(line_idx);
+        }
+    }
+
+    // Backward sweep: propagate flowing status upward
+    for line_idx in (block.start..block.end).rev() {
+        if flowing_lines.contains(&line_idx) || lines[line_idx].is_empty() {
+            continue;
+        }
+        if line_idx + 1 < block.end
+            && flowing_lines.contains(&(line_idx + 1))
+            && line_max_gap(&lines[line_idx]) < column_gap_threshold
+        {
+            flowing_lines.insert(line_idx);
+        }
+    }
+
+    // Render flowing lines
+    for &line_idx in &flowing_lines {
+        raw_lines[line_idx] = render_line_as_flowing_text(
+            &mut lines[line_idx],
+            block_min_x,
+            median_width,
+            &mut meta[line_idx],
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main grid projection
+// ---------------------------------------------------------------------------
+
+fn project_to_grid(page: &Page, mut projection_boxes: Vec<ProjectedTextItem>) -> (Vec<ProjectedTextItem>, String) {
+    // Step 1a: Filter out items that are purely dots
+    let mut dot_count = 0usize;
+    projection_boxes.iter().for_each(|item| {
+        if item.item.text.chars().all(|c| c == '.' || c == '·' || c == '•') {
+            dot_count += 1;
+        }
+    });
+
+    if dot_count > 100 && (dot_count as f64) > (projection_boxes.len() as f64) * 0.05 {
+        projection_boxes.retain(|item| {
+            !item.item.text.chars().all(|c| c == '.' || c == '·' || c == '•')
+        });
+    }
+
+    // Step 1b: Round dimensions
+    for item in projection_boxes.iter_mut() {
+        item.item.width = item.item.width.round();
+        item.item.height = item.item.height.round();
+    }
+
+    // Step 1c: Compute median distances
+    let (median_width, median_height) = compute_median_textbox_size(&projection_boxes);
+
+    // Step 1d: Handle reading order rotations
+    handle_rotation_reading_order(&mut projection_boxes, page.page_height);
+
+    // Step 1e: Form lines of boxes
+    let mut lines = form_lines(&mut projection_boxes, median_width, median_height, page.page_width);
+    if lines.is_empty() {
+        return (Vec::new(), String::new());
+    }
+
+    // Step 2: Segment into blocks
+    let blocks = segment_blocks(&lines);
+
+    let mut meta: Vec<Vec<BoxMeta>> = lines
+        .iter()
+        .map(|line| vec![BoxMeta::default(); line.len()])
+        .collect();
+
+    let mut raw_lines = vec![String::new(); lines.len()];
+
+    // Page-scoped forward anchors (carry alignment across blocks)
     let mut forward_left: BTreeMap<i32, usize> = BTreeMap::new();
     let mut forward_right: BTreeMap<i32, usize> = BTreeMap::new();
     let mut forward_center: BTreeMap<i32, usize> = BTreeMap::new();
     let mut forward_floating: BTreeMap<i32, usize> = BTreeMap::new();
 
-    let mut raw_lines = vec![String::new(); lines.len()];
+    for block in &blocks {
+        // --- Anchor extraction (per block) ---
+        let (mut anchor_left, mut anchor_right, mut anchor_center) =
+            extract_block_anchors(&lines, block);
 
-    let mut has_changed = true;
-    while has_changed || !left_snaps.is_empty() || !right_snaps.is_empty() || !center_snaps.is_empty() {
-        has_changed = false;
+        merge_nearby_anchor_groups(&mut anchor_left);
+        merge_nearby_anchor_groups(&mut anchor_right);
+        merge_nearby_anchor_groups(&mut anchor_center);
 
-        // Render floating/unsnapped first when they are not blocked by earlier pending snap columns.
-        for line_idx in 0..lines.len() {
+        // Isolation filtering: remove vertically isolated anchor members
+        delta_min_filter(&mut anchor_left, &lines, page.page_height, 0.2);
+        delta_min_filter(&mut anchor_right, &lines, page.page_height, 0.17);
+        delta_min_filter(&mut anchor_center, &lines, page.page_height, 0.05);
+
+        // Intercept filtering: remove anchors crossed by other text
+        intercept_filter(&mut anchor_left, &lines);
+        intercept_filter(&mut anchor_right, &lines);
+        intercept_filter(&mut anchor_center, &lines);
+
+        // Try to align floating bboxes to nearby existing anchors
+        let anchored = anchored_items_set(&anchor_left, &anchor_right, &anchor_center);
+        try_align_floating(
+            &mut anchor_left, &lines, block, &anchored, 2.0,
+            |item| item.x, |item| anchor_key(item.x),
+        );
+        let anchored = anchored_items_set(&anchor_left, &anchor_right, &anchor_center);
+        try_align_floating(
+            &mut anchor_right, &lines, block, &anchored, 2.0,
+            |item| item.x + item.width, |item| anchor_key(item.x + item.width),
+        );
+        let anchored = anchored_items_set(&anchor_left, &anchor_right, &anchor_center);
+        try_align_floating(
+            &mut anchor_center, &lines, block, &anchored, 2.0,
+            |item| item.x + item.width * 0.5, |item| anchor_key(item.x + item.width * 0.5),
+        );
+
+        // Remove singletons
+        anchor_left.retain(|_, v| v.len() >= 2);
+        anchor_right.retain(|_, v| v.len() >= 2);
+        anchor_center.retain(|_, v| v.len() >= 2);
+
+        // --- Flowing block detection ---
+        if is_flowing_text_block(&lines, block, &anchor_left, &anchor_right, &anchor_center, page.page_width) {
+            render_flowing_block(&mut lines, block, &mut raw_lines, &mut meta, median_width);
+            continue;
+        }
+
+        // --- Assign anchors to items in this block ---
+        for (anchor, members) in &anchor_left {
+            for &(li, bi) in members {
+                meta[li][bi].left_anchor = Some(*anchor);
+            }
+        }
+        for (anchor, members) in &anchor_right {
+            for &(li, bi) in members {
+                meta[li][bi].right_anchor = Some(*anchor);
+            }
+        }
+        for (anchor, members) in &anchor_center {
+            for &(li, bi) in members {
+                meta[li][bi].center_anchor = Some(*anchor);
+            }
+        }
+
+        // Resolve snap kind (strongest anchor wins; tie-break: left > right > center)
+        for line_idx in block.start..block.end {
+            for box_idx in 0..lines[line_idx].len() {
+                let left_count = meta[line_idx][box_idx]
+                    .left_anchor
+                    .and_then(|k| anchor_left.get(&k).map(|v| v.len()))
+                    .unwrap_or(0);
+                let right_count = meta[line_idx][box_idx]
+                    .right_anchor
+                    .and_then(|k| anchor_right.get(&k).map(|v| v.len()))
+                    .unwrap_or(0);
+                let center_count = meta[line_idx][box_idx]
+                    .center_anchor
+                    .and_then(|k| anchor_center.get(&k).map(|v| v.len()))
+                    .unwrap_or(0);
+
+                if left_count == 0 && right_count == 0 && center_count == 0 {
+                    continue;
+                }
+
+                let kind = if left_count >= right_count && left_count >= center_count {
+                    SnapKind::Left
+                } else if right_count >= left_count && right_count >= center_count {
+                    SnapKind::Right
+                } else {
+                    SnapKind::Center
+                };
+                meta[line_idx][box_idx].snap = Some(kind);
+            }
+        }
+
+        // --- Per-line flowing detection (within structured blocks) ---
+        detect_and_render_flowing_lines(
+            &mut lines, block, &mut raw_lines, &mut meta,
+            median_width, page.page_width,
+        );
+
+        // --- Compute spacing hints (skip already-rendered flowing items) ---
+        for line_idx in block.start..block.end {
             for box_idx in 0..lines[line_idx].len() {
                 if meta[line_idx][box_idx].rendered {
                     continue;
                 }
+                if box_idx == 0 || meta[line_idx][box_idx - 1].rendered {
+                    meta[line_idx][box_idx].should_space = 0;
+                    continue;
+                }
+                let prev = &lines[line_idx][box_idx - 1].item;
+                let cur = &lines[line_idx][box_idx].item;
+                let x_delta = cur.x - (prev.x + prev.width);
 
-                if !meta[line_idx][box_idx].force_unsnapped {
-                    if meta[line_idx][box_idx].snap.is_some() {
+                let mut should_space = 0usize;
+                if x_delta > 2.0 {
+                    should_space = 1;
+                    let prev_len = prev.text.chars().count().max(1) as f32;
+                    let prev_char_width = (prev.width / prev_len).max(0.1);
+                    if x_delta > prev_char_width * 2.0 {
+                        let column_gap_threshold = page.page_width * 0.1;
+                        let same_column = x_delta < column_gap_threshold;
+
+                        let cur_snap = meta[line_idx][box_idx].snap;
+                        let prev_snap = meta[line_idx][box_idx - 1].snap;
+                        let cur_is_left_snap = cur_snap == Some(SnapKind::Left);
+                        let prev_is_right_snap = prev_snap == Some(SnapKind::Right);
+                        let both_snapped = cur_snap.is_some() && prev_snap.is_some();
+                        let force_unsnapped = meta[line_idx][box_idx].force_unsnapped;
+
+                        if (!force_unsnapped && x_delta > prev_char_width * 8.0)
+                            || cur_is_left_snap
+                            || prev_is_right_snap
+                            || both_snapped
+                        {
+                            should_space = if same_column { FLOATING_SPACES } else { COLUMN_SPACES };
+                        } else {
+                            should_space = if same_column { 1 } else { FLOATING_SPACES };
+                        }
+                    }
+                }
+                meta[line_idx][box_idx].should_space = should_space;
+            }
+        }
+
+        // --- Build block-scoped snap lists ---
+        let mut left_snaps: Vec<i32> = anchor_left.keys().copied().collect();
+        let mut right_snaps: Vec<i32> = anchor_right.keys().copied().collect();
+        let mut center_snaps: Vec<i32> = anchor_center.keys().copied().collect();
+        left_snaps.sort_unstable();
+        right_snaps.sort_unstable();
+        center_snaps.sort_unstable();
+
+        let mut floating_set: HashSet<i32> = HashSet::new();
+        for line_idx in block.start..block.end {
+            for (box_idx, bbox) in lines[line_idx].iter().enumerate() {
+                if meta[line_idx][box_idx].snap.is_none() && !meta[line_idx][box_idx].rendered {
+                    floating_set.insert(anchor_key(bbox.item.x));
+                }
+            }
+        }
+        let mut floating_snaps: Vec<i32> = floating_set.into_iter().collect();
+        floating_snaps.sort_unstable();
+
+        // --- Main rendering loop (scoped to block) ---
+        let mut has_changed = true;
+        while has_changed || !left_snaps.is_empty() || !right_snaps.is_empty() || !center_snaps.is_empty() {
+            has_changed = false;
+
+            // Render floating/unsnapped items first
+            for line_idx in block.start..block.end {
+                for box_idx in 0..lines[line_idx].len() {
+                    if meta[line_idx][box_idx].rendered {
                         continue;
                     }
 
-                    let x_key = anchor_key(lines[line_idx][box_idx].item.x);
-                    let center_key = anchor_key(
-                        lines[line_idx][box_idx].item.x + lines[line_idx][box_idx].item.width * 0.5,
-                    );
-                    if left_snaps.first().copied().is_some_and(|v| v < x_key)
-                        || right_snaps.first().copied().is_some_and(|v| v < x_key)
-                        || center_snaps.first().copied().is_some_and(|v| v < center_key)
-                    {
-                        continue;
+                    if !meta[line_idx][box_idx].force_unsnapped {
+                        if meta[line_idx][box_idx].snap.is_some() {
+                            continue;
+                        }
+
+                        let x_key = anchor_key(lines[line_idx][box_idx].item.x);
+                        let center_key = anchor_key(
+                            lines[line_idx][box_idx].item.x + lines[line_idx][box_idx].item.width * 0.5,
+                        );
+                        if left_snaps.first().copied().is_some_and(|v| v < x_key)
+                            || right_snaps.first().copied().is_some_and(|v| v < x_key)
+                            || center_snaps.first().copied().is_some_and(|v| v < center_key)
+                        {
+                            continue;
+                        }
+                    }
+
+                    if !can_render_bbox(&meta[line_idx], box_idx) {
+                        break;
+                    }
+
+                    let (bbox_x, bbox_w, bbox_text) = {
+                        let b = &lines[line_idx][box_idx].item;
+                        (b.x, b.width, b.text.clone())
+                    };
+                    let mut target_x = ((bbox_x / median_width).round() as isize)
+                        .max(0)
+                        .min(COLUMN_SPACES as isize) as usize;
+
+                    let x_key = anchor_key(bbox_x);
+                    let last_snap_left = forward_left
+                        .range(..=x_key)
+                        .map(|(_, v)| *v)
+                        .max()
+                        .unwrap_or(0);
+
+                    let line_max = last_snap_left.max(trim_end_len(&raw_lines[line_idx]) + meta[line_idx][box_idx].should_space);
+                    if target_x < line_max {
+                        target_x = line_max;
+                    }
+
+                    if !meta[line_idx][box_idx].force_unsnapped {
+                        let floating_key = anchor_key(bbox_x);
+                        if let Some(floating_anchor) = forward_floating.get(&floating_key).copied()
+                            && target_x < floating_anchor
+                        {
+                            let adjusted = floating_anchor.min(target_x + 4);
+                            if adjusted > target_x {
+                                target_x = adjusted;
+                            }
+                        }
+                    }
+
+                    trim_end_in_place(&mut raw_lines[line_idx]);
+                    let before_len = raw_lines[line_idx].len();
+                    if target_x > before_len {
+                        raw_lines[line_idx].push_str(&" ".repeat(target_x - before_len));
+                    }
+                    let start_x = raw_lines[line_idx].len();
+                    raw_lines[line_idx].push_str(&bbox_text);
+
+                    meta[line_idx][box_idx].rendered = true;
+                    meta[line_idx][box_idx].projected_x = start_x;
+                    lines[line_idx][box_idx].rendered = true;
+                    lines[line_idx][box_idx].num_spaces = start_x.saturating_sub(before_len);
+                    has_changed = true;
+
+                    let next_should_space = if box_idx + 1 < lines[line_idx].len() {
+                        meta[line_idx][box_idx + 1].should_space
+                    } else {
+                        0
+                    };
+                    let right_bound = anchor_key(bbox_x + bbox_w);
+                    let target_len = raw_lines[line_idx].len() + next_should_space;
+
+                    update_forward_anchor_right_bound(&left_snaps, &mut forward_left, right_bound, target_len);
+                    update_forward_anchor_right_bound(&right_snaps, &mut forward_right, right_bound, target_len);
+                    update_forward_anchor_right_bound(&floating_snaps, &mut forward_floating, right_bound, target_len);
+                }
+            }
+
+            // Pick next snap to process
+            let left_first = left_snaps.first().copied();
+            let right_first = right_snaps.first().copied();
+            let center_first = center_snaps.first().copied();
+
+            let next_kind = match (left_first, right_first, center_first) {
+                (None, None, None) => None,
+                (Some(_), None, None) => Some(SnapKind::Left),
+                (None, Some(_), None) => Some(SnapKind::Right),
+                (None, None, Some(_)) => Some(SnapKind::Center),
+                (Some(l), Some(r), None) => Some(if l <= r { SnapKind::Left } else { SnapKind::Right }),
+                (Some(l), None, Some(c)) => Some(if l <= c { SnapKind::Left } else { SnapKind::Center }),
+                (None, Some(r), Some(c)) => Some(if r <= c { SnapKind::Right } else { SnapKind::Center }),
+                (Some(l), Some(r), Some(c)) => {
+                    if l <= r && l <= c {
+                        Some(SnapKind::Left)
+                    } else if r <= l && r <= c {
+                        Some(SnapKind::Right)
+                    } else {
+                        Some(SnapKind::Center)
                     }
                 }
+            };
 
-                if !can_render_bbox(&meta[line_idx], box_idx) {
-                    break;
+            let Some(kind) = next_kind else {
+                continue;
+            };
+
+            let current_anchor = match kind {
+                SnapKind::Left => left_snaps.first().copied(),
+                SnapKind::Right => right_snaps.first().copied(),
+                SnapKind::Center => center_snaps.first().copied(),
+            };
+
+            let Some(current_anchor) = current_anchor else {
+                continue;
+            };
+
+            // Find items in this block matching the current anchor
+            let mut turn_items: Vec<(usize, usize)> = Vec::new();
+            for line_idx in block.start..block.end {
+                for box_idx in 0..lines[line_idx].len() {
+                    if meta[line_idx][box_idx].rendered {
+                        continue;
+                    }
+                    let matches = match kind {
+                        SnapKind::Left => meta[line_idx][box_idx].left_anchor == Some(current_anchor),
+                        SnapKind::Right => meta[line_idx][box_idx].right_anchor == Some(current_anchor),
+                        SnapKind::Center => meta[line_idx][box_idx].center_anchor == Some(current_anchor),
+                    };
+                    if matches {
+                        turn_items.push((line_idx, box_idx));
+                    }
                 }
+            }
 
+            if turn_items.is_empty() {
+                match kind {
+                    SnapKind::Left => { left_snaps.remove(0); }
+                    SnapKind::Right => { right_snaps.remove(0); }
+                    SnapKind::Center => { center_snaps.remove(0); }
+                }
+                continue;
+            }
+
+            has_changed = true;
+
+            let mut target_x = ((anchor_to_x(current_anchor) / median_width).round() as isize)
+                .max(0)
+                .min(COLUMN_SPACES as isize) as usize;
+
+            let line_max = match kind {
+                SnapKind::Left => turn_items
+                    .iter()
+                    .map(|(li, bi)| raw_lines[*li].len() + line_space_end(&raw_lines[*li], meta[*li][*bi].should_space) + 1)
+                    .max()
+                    .unwrap_or(0),
+                SnapKind::Right => turn_items
+                    .iter()
+                    .map(|(li, bi)| {
+                        let bbox = &lines[*li][*bi].item;
+                        let x_key = anchor_key(bbox.x);
+                        let last_snap_left = forward_left
+                            .range(..=x_key)
+                            .map(|(_, v)| *v)
+                            .max()
+                            .unwrap_or(0);
+                        let left_bound = last_snap_left.max(trim_end_len(&raw_lines[*li]) + meta[*li][*bi].should_space);
+                        left_bound + bbox.text.chars().count()
+                    })
+                    .max()
+                    .unwrap_or(0),
+                SnapKind::Center => turn_items
+                    .iter()
+                    .map(|(li, bi)| {
+                        let text_half = lines[*li][*bi].item.text.chars().count() / 2;
+                        raw_lines[*li].len() + text_half + line_space_end(&raw_lines[*li], meta[*li][*bi].should_space)
+                    })
+                    .max()
+                    .unwrap_or(0),
+            };
+
+            if target_x < line_max {
+                target_x = line_max;
+            }
+
+            match kind {
+                SnapKind::Left => {
+                    if let Some(v) = forward_left.get(&current_anchor).copied() {
+                        target_x = target_x.max(v);
+                    }
+                    forward_left.insert(current_anchor, target_x);
+                }
+                SnapKind::Right => {
+                    if let Some(v) = forward_right.get(&current_anchor).copied() {
+                        target_x = target_x.max(v);
+                    }
+                    forward_right.insert(current_anchor, target_x);
+                }
+                SnapKind::Center => {
+                    if let Some(v) = forward_center.get(&current_anchor).copied() {
+                        target_x = target_x.max(v);
+                    }
+                    forward_center.insert(current_anchor, target_x);
+                }
+            }
+
+            for (line_idx, box_idx) in turn_items {
                 let (bbox_x, bbox_w, bbox_text) = {
                     let b = &lines[line_idx][box_idx].item;
                     (b.x, b.width, b.text.clone())
                 };
-                let mut target_x = ((bbox_x / median_width).round() as isize)
-                    .max(0)
-                    .min(COLUMN_SPACES as isize) as usize;
-
-                let x_key = anchor_key(bbox_x);
-                let last_snap_left = forward_left
-                    .range(..=x_key)
-                    .map(|(_, v)| *v)
-                    .max()
-                    .unwrap_or(0);
-
-                let line_max = last_snap_left.max(trim_end_len(&raw_lines[line_idx]) + meta[line_idx][box_idx].should_space);
-                if target_x < line_max {
-                    target_x = line_max;
-                }
-
-                if !meta[line_idx][box_idx].force_unsnapped {
-                    let floating_key = anchor_key(bbox_x);
-                    if let Some(floating_anchor) = forward_floating.get(&floating_key).copied()
-                        && target_x < floating_anchor
-                    {
-                        let adjusted = floating_anchor.min(target_x + 4);
-                        if adjusted > target_x {
-                            target_x = adjusted;
+                match kind {
+                    SnapKind::Left => {
+                        let before = raw_lines[line_idx].len();
+                        if target_x > before {
+                            raw_lines[line_idx].push_str(&" ".repeat(target_x - before));
                         }
+                        let start_x = raw_lines[line_idx].len();
+                        raw_lines[line_idx].push_str(&bbox_text);
+                        meta[line_idx][box_idx].projected_x = start_x;
+                        lines[line_idx][box_idx].num_spaces = start_x.saturating_sub(before);
+                    }
+                    SnapKind::Right => {
+                        trim_end_in_place(&mut raw_lines[line_idx]);
+                        let text_len = bbox_text.chars().count();
+                        let before = raw_lines[line_idx].len();
+                        let trim_len = trim_end_len(&raw_lines[line_idx]);
+                        if target_x > trim_len + text_len {
+                            let pad = target_x - raw_lines[line_idx].len() - text_len;
+                            raw_lines[line_idx].push_str(&" ".repeat(pad));
+                        }
+                        let start_x = raw_lines[line_idx].len();
+                        raw_lines[line_idx].push_str(&bbox_text);
+                        meta[line_idx][box_idx].projected_x = start_x;
+                        lines[line_idx][box_idx].num_spaces = start_x.saturating_sub(before);
+                    }
+                    SnapKind::Center => {
+                        let text_half = bbox_text.chars().count() / 2;
+                        let before = raw_lines[line_idx].len();
+                        if target_x > raw_lines[line_idx].len() + text_half {
+                            let pad = target_x - raw_lines[line_idx].len() - text_half;
+                            raw_lines[line_idx].push_str(&" ".repeat(pad));
+                        }
+                        let start_x = raw_lines[line_idx].len();
+                        raw_lines[line_idx].push_str(&bbox_text);
+                        meta[line_idx][box_idx].projected_x = start_x;
+                        lines[line_idx][box_idx].num_spaces = start_x.saturating_sub(before);
                     }
                 }
 
-                trim_end_in_place(&mut raw_lines[line_idx]);
-                let before_len = raw_lines[line_idx].len();
-                if target_x > before_len {
-                    raw_lines[line_idx].push_str(&" ".repeat(target_x - before_len));
-                }
-                let start_x = raw_lines[line_idx].len();
-                raw_lines[line_idx].push_str(&bbox_text);
-
                 meta[line_idx][box_idx].rendered = true;
-                meta[line_idx][box_idx].projected_x = start_x;
                 lines[line_idx][box_idx].rendered = true;
-                lines[line_idx][box_idx].num_spaces = start_x.saturating_sub(before_len);
-                has_changed = true;
 
                 let next_should_space = if box_idx + 1 < lines[line_idx].len() {
                     meta[line_idx][box_idx + 1].should_space
@@ -1132,235 +1803,40 @@ fn project_to_grid(page: &Page, mut projection_boxes: Vec<ProjectedTextItem>) ->
                 };
                 let right_bound = anchor_key(bbox_x + bbox_w);
                 let target_len = raw_lines[line_idx].len() + next_should_space;
-
                 update_forward_anchor_right_bound(&left_snaps, &mut forward_left, right_bound, target_len);
                 update_forward_anchor_right_bound(&right_snaps, &mut forward_right, right_bound, target_len);
                 update_forward_anchor_right_bound(&floating_snaps, &mut forward_floating, right_bound, target_len);
             }
+
+            match kind {
+                SnapKind::Left => { left_snaps.remove(0); }
+                SnapKind::Right => { right_snaps.remove(0); }
+                SnapKind::Center => { center_snaps.remove(0); }
+            }
         }
 
-        let left_first = left_snaps.first().copied();
-        let right_first = right_snaps.first().copied();
-        let center_first = center_snaps.first().copied();
-
-        let next_kind = match (left_first, right_first, center_first) {
-            (None, None, None) => None,
-            (Some(_), None, None) => Some(SnapKind::Left),
-            (None, Some(_), None) => Some(SnapKind::Right),
-            (None, None, Some(_)) => Some(SnapKind::Center),
-            (Some(l), Some(r), None) => Some(if l <= r { SnapKind::Left } else { SnapKind::Right }),
-            (Some(l), None, Some(c)) => Some(if l <= c { SnapKind::Left } else { SnapKind::Center }),
-            (None, Some(r), Some(c)) => Some(if r <= c { SnapKind::Right } else { SnapKind::Center }),
-            (Some(l), Some(r), Some(c)) => {
-                if l <= r && l <= c {
-                    Some(SnapKind::Left)
-                } else if r <= l && r <= c {
-                    Some(SnapKind::Right)
-                } else {
-                    Some(SnapKind::Center)
-                }
-            }
-        };
-
-        let Some(kind) = next_kind else {
-            continue;
-        };
-
-        let current_anchor = match kind {
-            SnapKind::Left => left_snaps.first().copied(),
-            SnapKind::Right => right_snaps.first().copied(),
-            SnapKind::Center => center_snaps.first().copied(),
-        };
-
-        let Some(current_anchor) = current_anchor else {
-            continue;
-        };
-
-        let mut turn_items: Vec<(usize, usize)> = Vec::new();
-        for line_idx in 0..lines.len() {
+        // Fallback: render anything still not rendered in this block
+        for line_idx in block.start..block.end {
             for box_idx in 0..lines[line_idx].len() {
                 if meta[line_idx][box_idx].rendered {
                     continue;
                 }
-                let matches = match kind {
-                    SnapKind::Left => meta[line_idx][box_idx].left_anchor == Some(current_anchor),
-                    SnapKind::Right => meta[line_idx][box_idx].right_anchor == Some(current_anchor),
-                    SnapKind::Center => meta[line_idx][box_idx].center_anchor == Some(current_anchor),
-                };
-                if matches {
-                    turn_items.push((line_idx, box_idx));
+                if !raw_lines[line_idx].is_empty() && !raw_lines[line_idx].ends_with(' ') {
+                    raw_lines[line_idx].push(' ');
                 }
-            }
-        }
-
-        if turn_items.is_empty() {
-            match kind {
-                SnapKind::Left => {
-                    left_snaps.remove(0);
-                }
-                SnapKind::Right => {
-                    right_snaps.remove(0);
-                }
-                SnapKind::Center => {
-                    center_snaps.remove(0);
-                }
-            }
-            continue;
-        }
-
-        has_changed = true;
-
-        let mut target_x = ((anchor_to_x(current_anchor) / median_width).round() as isize)
-            .max(0)
-            .min(COLUMN_SPACES as isize) as usize;
-
-        let line_max = match kind {
-            SnapKind::Left => turn_items
-                .iter()
-                .map(|(li, bi)| raw_lines[*li].len() + line_space_end(&raw_lines[*li], meta[*li][*bi].should_space) + 1)
-                .max()
-                .unwrap_or(0),
-            SnapKind::Right => turn_items
-                .iter()
-                .map(|(li, bi)| {
-                    let bbox = &lines[*li][*bi].item;
-                    let x_key = anchor_key(bbox.x);
-                    let last_snap_left = forward_left
-                        .range(..=x_key)
-                        .map(|(_, v)| *v)
-                        .max()
-                        .unwrap_or(0);
-                    let left_bound = last_snap_left.max(trim_end_len(&raw_lines[*li]) + meta[*li][*bi].should_space);
-                    left_bound + bbox.text.chars().count()
-                })
-                .max()
-                .unwrap_or(0),
-            SnapKind::Center => turn_items
-                .iter()
-                .map(|(li, bi)| {
-                    let text_half = lines[*li][*bi].item.text.chars().count() / 2;
-                    raw_lines[*li].len() + text_half + line_space_end(&raw_lines[*li], meta[*li][*bi].should_space)
-                })
-                .max()
-                .unwrap_or(0),
-        };
-
-        if target_x < line_max {
-            target_x = line_max;
-        }
-
-        match kind {
-            SnapKind::Left => {
-                if let Some(v) = forward_left.get(&current_anchor).copied() {
-                    target_x = target_x.max(v);
-                }
-                forward_left.insert(current_anchor, target_x);
-            }
-            SnapKind::Right => {
-                if let Some(v) = forward_right.get(&current_anchor).copied() {
-                    target_x = target_x.max(v);
-                }
-                forward_right.insert(current_anchor, target_x);
-            }
-            SnapKind::Center => {
-                if let Some(v) = forward_center.get(&current_anchor).copied() {
-                    target_x = target_x.max(v);
-                }
-                forward_center.insert(current_anchor, target_x);
-            }
-        }
-
-        for (line_idx, box_idx) in turn_items {
-            let (bbox_x, bbox_w, bbox_text) = {
-                let b = &lines[line_idx][box_idx].item;
-                (b.x, b.width, b.text.clone())
-            };
-            match kind {
-                SnapKind::Left => {
-                    let before = raw_lines[line_idx].len();
-                    if target_x > before {
-                        raw_lines[line_idx].push_str(&" ".repeat(target_x - before));
-                    }
-                    let start_x = raw_lines[line_idx].len();
-                    raw_lines[line_idx].push_str(&bbox_text);
-                    meta[line_idx][box_idx].projected_x = start_x;
-                    lines[line_idx][box_idx].num_spaces = start_x.saturating_sub(before);
-                }
-                SnapKind::Right => {
-                    trim_end_in_place(&mut raw_lines[line_idx]);
-                    let text_len = bbox_text.chars().count();
-                    let before = raw_lines[line_idx].len();
-                    let trim_len = trim_end_len(&raw_lines[line_idx]);
-                    if target_x > trim_len + text_len {
-                        let pad = target_x - raw_lines[line_idx].len() - text_len;
-                        raw_lines[line_idx].push_str(&" ".repeat(pad));
-                    }
-                    let start_x = raw_lines[line_idx].len();
-                    raw_lines[line_idx].push_str(&bbox_text);
-                    meta[line_idx][box_idx].projected_x = start_x;
-                    lines[line_idx][box_idx].num_spaces = start_x.saturating_sub(before);
-                }
-                SnapKind::Center => {
-                    let text_half = bbox_text.chars().count() / 2;
-                    let before = raw_lines[line_idx].len();
-                    if target_x > raw_lines[line_idx].len() + text_half {
-                        let pad = target_x - raw_lines[line_idx].len() - text_half;
-                        raw_lines[line_idx].push_str(&" ".repeat(pad));
-                    }
-                    let start_x = raw_lines[line_idx].len();
-                    raw_lines[line_idx].push_str(&bbox_text);
-                    meta[line_idx][box_idx].projected_x = start_x;
-                    lines[line_idx][box_idx].num_spaces = start_x.saturating_sub(before);
-                }
-            }
-
-            meta[line_idx][box_idx].rendered = true;
-            lines[line_idx][box_idx].rendered = true;
-
-            let next_should_space = if box_idx + 1 < lines[line_idx].len() {
-                meta[line_idx][box_idx + 1].should_space
-            } else {
-                0
-            };
-            let right_bound = anchor_key(bbox_x + bbox_w);
-            let target_len = raw_lines[line_idx].len() + next_should_space;
-            update_forward_anchor_right_bound(&left_snaps, &mut forward_left, right_bound, target_len);
-            update_forward_anchor_right_bound(&right_snaps, &mut forward_right, right_bound, target_len);
-            update_forward_anchor_right_bound(&floating_snaps, &mut forward_floating, right_bound, target_len);
-        }
-
-        match kind {
-            SnapKind::Left => {
-                left_snaps.remove(0);
-            }
-            SnapKind::Right => {
-                right_snaps.remove(0);
-            }
-            SnapKind::Center => {
-                center_snaps.remove(0);
+                let start_x = raw_lines[line_idx].len();
+                raw_lines[line_idx].push_str(&lines[line_idx][box_idx].item.text);
+                meta[line_idx][box_idx].rendered = true;
+                meta[line_idx][box_idx].projected_x = start_x;
+                lines[line_idx][box_idx].rendered = true;
             }
         }
     }
 
-    // Fallback: render anything still not rendered to avoid data loss.
-    for line_idx in 0..lines.len() {
-        for box_idx in 0..lines[line_idx].len() {
-            if meta[line_idx][box_idx].rendered {
-                continue;
-            }
-            if !raw_lines[line_idx].is_empty() && !raw_lines[line_idx].ends_with(' ') {
-                raw_lines[line_idx].push(' ');
-            }
-            let start_x = raw_lines[line_idx].len();
-            raw_lines[line_idx].push_str(&lines[line_idx][box_idx].item.text);
-            meta[line_idx][box_idx].rendered = true;
-            meta[line_idx][box_idx].projected_x = start_x;
-            lines[line_idx][box_idx].rendered = true;
-        }
+    // Fix sparse blocks (per block)
+    for block in &blocks {
+        fix_sparse_blocks(&mut raw_lines, block.start, block.end);
     }
-
-    let raw_line_count = raw_lines.len();
-    fix_sparse_blocks(&mut raw_lines, 0, raw_line_count);
 
     // Persist projected positions and flatten in line order.
     let mut flattened: Vec<ProjectedTextItem> = Vec::with_capacity(lines.iter().map(|l| l.len()).sum());

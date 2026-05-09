@@ -84,11 +84,19 @@ fn extract_page_text_items(
             continue;
         }
 
-        // Map to a Rust char, with special-case replacements
-        let c = match unicode {
-            0x02 => '-',  // STX → hyphen (common in some PDF encodings)
+        // Map to a Rust char, with special-case replacements.
+        // Some PDF fonts encode ligatures as control characters; expand them.
+        // We use the first char for segment decisions, then append trailing chars.
+        let (c, ligature_tail): (char, &str) = match unicode {
+            0x02 => ('-', ""),        // STX → hyphen (common in some PDF encodings)
+            0x1A => ('f', "f"),       // ff ligature
+            0x1B => ('f', "t"),       // ft ligature
+            0x1C => ('f', "i"),       // fi ligature
+            0x1D => ('T', "h"),       // Th ligature
+            0x1E => ('f', "fi"),      // ffi ligature
+            0x1F => ('f', "l"),       // fl ligature
             _ => match char::from_u32(unicode) {
-                Some(c) => c,
+                Some(ch_mapped) => (ch_mapped, ""),
                 None => continue,
             },
         };
@@ -114,6 +122,11 @@ fn extract_page_text_items(
         let Some(loose_box) = ch.loose_char_box() else { continue };
         let vp_loose = page.bounds_to_viewport(view_box, &loose_box);
 
+        // Skip zero-height characters (phantom dots from dot leader decorations)
+        if vp_loose.bottom - vp_loose.top < 0.5 {
+            continue;
+        }
+
         // Also get strict char box for gap calculation (stays in viewport space)
         let Some(strict_box) = ch.char_box() else { continue };
         let strict_rect = RectF {
@@ -132,28 +145,100 @@ fn extract_page_text_items(
 
             let gap = vp_strict.left - seg.last_char_right;
 
-            if !y_overlap || gap >= MAX_INLINE_GAP {
+            // Detect line change using two complementary checks:
+            // 1. Strict vertical separation: char's strict top is well below last char's strict bottom
+            // 2. Line wrap: char goes back leftward AND strict top is below last char's strict bottom
+            //    (even slightly), indicating text wrapped to a new line within the same text object
+            let strict_below = vp_strict.top > seg.last_char_bottom;
+            let large_leftward_jump = gap < -5.0;
+            let line_changed = vp_strict.top > seg.last_char_bottom + y_tolerance
+                || (strict_below && large_leftward_jump);
+
+            // Dot leader detection: break at the boundary between dots and non-dots.
+            // This prevents items like "Total . . . . 330,100" from merging.
+            let dot_leader_break = if seg.pending_space {
+                // With a pending space: break at dot/non-dot transitions
+                (c == '.' && seg.has_non_dot_content())
+                || (c != '.' && !seg.has_non_dot_content() && seg.char_count >= 3)
+            } else {
+                // Without a pending space: break when a dot follows non-dot content
+                // with a gap larger than typical intra-word spacing (dot leader dots
+                // are spaced apart, unlike periods in abbreviations like "U.S.")
+                c == '.' && seg.has_non_dot_content() && gap > seg.avg_char_width() * 0.4
+            };
+
+            if !y_overlap || line_changed || gap >= MAX_INLINE_GAP || dot_leader_break {
                 seg.flush(&mut items);
                 seg.start(c, &vp_loose, &vp_strict, &ch, page_rotation);
+                seg.append_ligature_tail(ligature_tail);
             } else if seg.pending_space {
                 let avg_cw = seg.avg_char_width();
                 if gap > avg_cw * 1.6 {
                     seg.flush(&mut items);
                     seg.start(c, &vp_loose, &vp_strict, &ch, page_rotation);
+                    seg.append_ligature_tail(ligature_tail);
                 } else {
                     seg.commit_pending_space();
                     seg.push_char(c, &vp_loose, &vp_strict, &ch);
+                    seg.append_ligature_tail(ligature_tail);
                 }
             } else {
                 seg.push_char(c, &vp_loose, &vp_strict, &ch);
+                seg.append_ligature_tail(ligature_tail);
             }
         } else {
             seg.start(c, &vp_loose, &vp_strict, &ch, page_rotation);
+            seg.append_ligature_tail(ligature_tail);
         }
     }
 
     seg.flush(&mut items);
+
+    // Dedup: remove items with identical text and overlapping bounding boxes.
+    // Some PDFs (especially those with chart/figure annotations) produce duplicate
+    // text objects at the same position.
+    dedup_overlapping_items(&mut items);
+
     Ok(items)
+}
+
+/// Remove duplicate text items that have the same text and significantly
+/// overlapping bounding boxes.
+fn dedup_overlapping_items(items: &mut Vec<TextItem>) {
+    if items.len() < 2 {
+        return;
+    }
+
+    let mut keep = vec![true; items.len()];
+    for i in 0..items.len() {
+        if !keep[i] {
+            continue;
+        }
+        for j in (i + 1)..items.len() {
+            if !keep[j] {
+                continue;
+            }
+            if items[i].text != items[j].text {
+                continue;
+            }
+
+            // Check bounding box overlap
+            let a = &items[i];
+            let b = &items[j];
+            let x_overlap = a.x < b.x + b.width && b.x < a.x + a.width;
+            let y_overlap = a.y < b.y + b.height && b.y < a.y + a.height;
+            if x_overlap && y_overlap {
+                keep[j] = false;
+            }
+        }
+    }
+
+    let mut idx = 0;
+    items.retain(|_| {
+        let k = keep[idx];
+        idx += 1;
+        k
+    });
 }
 
 /// Adjust character angle for page rotation.
@@ -224,6 +309,8 @@ struct SegmentBuilder {
     vp_bottom: f32,
     // Right edge of last char strict bounds (for gap calculation)
     last_char_right: f32,
+    // Bottom of last char strict bounds (for line-change detection)
+    last_char_bottom: f32,
     // Count of non-space characters (for avg width calculation)
     char_count: usize,
     // Font metadata (captured from the first character)
@@ -255,6 +342,7 @@ impl SegmentBuilder {
             vp_top: f32::MAX,
             vp_bottom: f32::MIN,
             last_char_right: f32::MIN,
+            last_char_bottom: f32::MIN,
             char_count: 0,
             font_name: None,
             font_size: 0.0,
@@ -300,6 +388,7 @@ impl SegmentBuilder {
         self.vp_top = vp_loose.top;
         self.vp_bottom = vp_loose.bottom;
         self.last_char_right = vp_strict.right;
+        self.last_char_bottom = vp_strict.bottom;
         self.char_count = 1;
         self.has_content = true;
         self.pending_space = false;
@@ -390,6 +479,7 @@ impl SegmentBuilder {
         self.vp_top = self.vp_top.min(vp_loose.top);
         self.vp_bottom = self.vp_bottom.max(vp_loose.bottom);
         self.last_char_right = vp_strict.right;
+        self.last_char_bottom = vp_strict.bottom;
         self.char_count += 1;
 
         // Accumulate glyph width
@@ -413,6 +503,17 @@ impl SegmentBuilder {
                 self.font_is_buggy = true;
             }
         }
+    }
+
+    /// Append extra characters to the segment text (for ligature expansion).
+    /// Does not update bounding boxes or char count.
+    fn append_ligature_tail(&mut self, tail: &str) {
+        self.text.push_str(tail);
+    }
+
+    /// Returns true if the segment contains any characters that aren't dots or spaces.
+    fn has_non_dot_content(&self) -> bool {
+        self.text.chars().any(|c| c != '.' && c != ' ' && c != '·' && c != '•')
     }
 
     /// Record that a space was seen.
@@ -470,6 +571,7 @@ impl SegmentBuilder {
         self.vp_top = f32::MAX;
         self.vp_bottom = f32::MIN;
         self.last_char_right = f32::MIN;
+        self.last_char_bottom = f32::MIN;
         self.char_count = 0;
         self.font_name = None;
         self.font_size = 0.0;
