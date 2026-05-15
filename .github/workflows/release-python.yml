@@ -247,7 +247,7 @@ jobs:
           python -c "
           from liteparse import LiteParse
           parser = LiteParse(ocr_enabled=False, quiet=True, max_pages=2)
-          result = parser.parse('demo/docs/apple-10q-q3-2025.pdf')
+          result = parser.parse('demo/docs/apple-10k-2024.pdf')
           assert result.num_pages == 2, f'Expected 2 pages, got {result.num_pages}'
           assert len(result.text) > 0, 'Expected non-empty text'
           page = result.get_page(1)
@@ -261,7 +261,7 @@ jobs:
           python -c "
           from liteparse import LiteParse
           parser = LiteParse(ocr_enabled=False, quiet=True, max_pages=1)
-          with open('demo/docs/apple-10q-q3-2025.pdf', 'rb') as f:
+          with open('demo/docs/apple-10k-2024.pdf', 'rb') as f:
               data = f.read()
           result = parser.parse(data)
           assert result.num_pages == 1
@@ -274,7 +274,7 @@ jobs:
           python -c "
           from liteparse import LiteParse
           parser = LiteParse(ocr_enabled=False, quiet=True)
-          screenshots = parser.screenshot('demo/docs/apple-10q-q3-2025.pdf', page_numbers=[1])
+          screenshots = parser.screenshot('demo/docs/apple-10k-2024.pdf', page_numbers=[1])
           assert len(screenshots) == 1
           assert screenshots[0].page_num == 1
           assert len(screenshots[0].image_bytes) > 0
@@ -284,7 +284,7 @@ jobs:
       - name: CLI test
         run: |
           lit --version
-          lit parse demo/docs/apple-10q-q3-2025.pdf --no-ocr --max-pages 1 -q | head -5
+          lit parse demo/docs/apple-10k-2024.pdf --no-ocr --max-pages 1 -q | head -5
           echo "CLI test passed"
 
   build-cli:
