@@ -129,8 +129,12 @@ jobs:
               set -eux
               # Static libs needed because musl rust defaults to -static-pie / crt-static
               # for build scripts. openssl-libs-static/zlib-static satisfy tesseract-rs build-deps.
+              # tesseract-rs's build.rs hard-codes -DCMAKE_CXX_COMPILER=clang++ and
+              # -stdlib=libc++, so we need real clang + libc++ in the image; gcc/g++ from
+              # build-base alone is not enough.
               apk add --no-cache \
                 build-base cmake git curl pkgconf perl \
+                clang libc++-dev \
                 tesseract-ocr-dev leptonica-dev \
                 openssl-dev openssl-libs-static zlib-static
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable -t x86_64-unknown-linux-musl
@@ -139,10 +143,6 @@ jobs:
               # so disable crt-static for the final link. Build scripts still link static
               # against openssl/zlib via the static libs above.
               export RUSTFLAGS="-C target-feature=-crt-static"
-              # tesseract-rs CMake project hard-codes clang++ as the default CXX; alpine
-              # ships gcc/g++ via build-base, so point CMake at those explicitly.
-              export CC=gcc CXX=g++
-              export CMAKE_C_COMPILER=gcc CMAKE_CXX_COMPILER=g++
               npx napi build --cargo-cwd ../../crates/liteparse-napi --platform --release --js false --dts native.d.ts --target x86_64-unknown-linux-musl .
             '
 
