@@ -60,10 +60,7 @@ impl Page<'_> {
 
 /// Pre-scan all page objects on the page, building `mcid → union(bbox)` in
 /// viewport space. Each struct node then unions the bboxes for its own mcids.
-fn collect_mcid_bboxes(
-    page: &Page<'_>,
-    view_box: &RectF,
-) -> std::collections::HashMap<i32, RectF> {
+fn collect_mcid_bboxes(page: &Page<'_>, view_box: &RectF) -> std::collections::HashMap<i32, RectF> {
     let vp = page.viewport_transform(view_box);
     let obj_count = unsafe { ffi!(FPDFPage_CountObjects(page.handle)) };
     let mut map: std::collections::HashMap<i32, RectF> = std::collections::HashMap::new();
@@ -192,7 +189,8 @@ fn read_element_type(elem: pdfium_sys::FPDF_STRUCTELEMENT) -> String {
 }
 
 fn read_alt_text(elem: pdfium_sys::FPDF_STRUCTELEMENT) -> Option<String> {
-    let s = read_widestring(|buf, len| unsafe { ffi!(FPDF_StructElement_GetAltText(elem, buf, len)) });
+    let s =
+        read_widestring(|buf, len| unsafe { ffi!(FPDF_StructElement_GetAltText(elem, buf, len)) });
     if s.is_empty() { None } else { Some(s) }
 }
 

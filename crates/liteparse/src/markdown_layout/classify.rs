@@ -2,9 +2,8 @@ use crate::types::{OutlineTarget, ParsedPage, ProjectedLine};
 
 use super::blocks::{Block, paragraph_from_accum};
 use super::headings::{
-    MAX_HEADING_LEVELS, heading_level_for, is_caption_line, looks_like_bold_heading,
-    is_toc_title, looks_like_numbered_bold_heading, outline_heading_level, page_is_toc,
-    struct_heading_level,
+    MAX_HEADING_LEVELS, heading_level_for, is_caption_line, is_toc_title, looks_like_bold_heading,
+    looks_like_numbered_bold_heading, outline_heading_level, page_is_toc, struct_heading_level,
 };
 use super::hr::detect_horizontal_rules;
 use super::inline::{
@@ -178,25 +177,23 @@ pub fn classify_page_with_filters(
     // already passed. Suppressed inside table y-extents to keep cell-spanning
     // raster cell backgrounds (rare but possible) from spawning a figure
     // mid-table.
-    let figure_entries: Vec<(f32, crate::types::ImageRef)> = if matches!(
-        image_mode,
-        crate::config::ImageMode::Off
-    ) {
-        Vec::new()
-    } else {
-        let mut v: Vec<(f32, crate::types::ImageRef)> = page
-            .image_refs
-            .iter()
-            .filter(|r| {
-                !table_y_extents
-                    .iter()
-                    .any(|(top, bot)| r.bbox.y >= *top - 2.0 && r.bbox.y <= *bot + 2.0)
-            })
-            .map(|r| (r.bbox.y, r.clone()))
-            .collect();
-        v.sort_by(|a, b| a.0.total_cmp(&b.0));
-        v
-    };
+    let figure_entries: Vec<(f32, crate::types::ImageRef)> =
+        if matches!(image_mode, crate::config::ImageMode::Off) {
+            Vec::new()
+        } else {
+            let mut v: Vec<(f32, crate::types::ImageRef)> = page
+                .image_refs
+                .iter()
+                .filter(|r| {
+                    !table_y_extents
+                        .iter()
+                        .any(|(top, bot)| r.bbox.y >= *top - 2.0 && r.bbox.y <= *bot + 2.0)
+                })
+                .map(|r| (r.bbox.y, r.clone()))
+                .collect();
+            v.sort_by(|a, b| a.0.total_cmp(&b.0));
+            v
+        };
     let mut figure_iter = figure_entries.into_iter().peekable();
 
     // Emit any HRs whose y is at or above `before_y`. Flushes the active
@@ -384,11 +381,7 @@ pub fn classify_page_with_filters(
         // TOCs list entries without inline trailing page numbers, so the
         // page-level detector misses them. `is_toc_title` matches the *entire*
         // trimmed line against an exact whitelist, so it can't fire mid-prose.
-        let toc_title_level = if is_toc_title(text) {
-            Some(1u8)
-        } else {
-            None
-        };
+        let toc_title_level = if is_toc_title(text) { Some(1u8) } else { None };
         let level = outline_level
             .or(size_level)
             .or(toc_title_level)
@@ -438,7 +431,10 @@ pub fn classify_page_with_filters(
                 && looks_like_numbered_bold_heading(
                     line,
                     rest,
-                    paragraph.as_ref().map(|p| &p.last).or(last_list_line.as_ref()),
+                    paragraph
+                        .as_ref()
+                        .map(|p| &p.last)
+                        .or(last_list_line.as_ref()),
                     lines.get(idx),
                 )
             {
@@ -571,14 +567,14 @@ pub fn classify_page_with_filters(
 
 #[cfg(test)]
 mod tests {
+    use super::super::blocks::{Block, render_blocks};
     use super::super::headings::{build_heading_map, compute_body_size};
     use super::super::repetition::compute_header_footer_set;
     use super::super::test_helpers::{
-        header_footer_page, line, mono_line, page, page_with_graphics, styled_line, stroke,
+        header_footer_page, line, mono_line, page, page_with_graphics, stroke, styled_line,
     };
     use super::*;
     use crate::types::TextItem;
-    use super::super::blocks::{Block, render_blocks};
 
     #[test]
     fn classify_emits_heading_and_paragraph() {

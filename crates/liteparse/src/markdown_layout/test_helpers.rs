@@ -98,11 +98,7 @@ pub(crate) fn line_with_spans(cells: &[(&str, f32)], y: f32, size: f32) -> Proje
 
 /// Build a line whose spans carry explicit per-span font metadata. Lets us
 /// exercise the mid-line emphasis pipeline without needing real PDF input.
-pub(crate) fn styled_line(
-    spans: &[(&str, f32, Option<&str>)],
-    y: f32,
-    size: f32,
-) -> ProjectedLine {
+pub(crate) fn styled_line(spans: &[(&str, f32, Option<&str>)], y: f32, size: f32) -> ProjectedLine {
     let items: Vec<TextItem> = spans
         .iter()
         .map(|(t, x, font)| TextItem {

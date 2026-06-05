@@ -41,8 +41,23 @@ pub(super) fn is_caption_line(text: &str) -> bool {
     // Try each known prefix: must be followed by a number (optionally with
     // separators) within the first ~20 chars.
     const PREFIXES: &[&str] = &[
-        "Figure", "Figures", "Fig.", "Fig ", "Table", "Tables", "Tab.", "Tab ",
-        "Equation", "Eq.", "Eq ", "Scheme", "Chart", "Plate", "Photo", "Algorithm", "Listing",
+        "Figure",
+        "Figures",
+        "Fig.",
+        "Fig ",
+        "Table",
+        "Tables",
+        "Tab.",
+        "Tab ",
+        "Equation",
+        "Eq.",
+        "Eq ",
+        "Scheme",
+        "Chart",
+        "Plate",
+        "Photo",
+        "Algorithm",
+        "Listing",
     ];
     let lower_t_first_word: String = t
         .chars()
@@ -550,7 +565,10 @@ pub(super) fn heading_level_for(size: f32, heading_map: &[(f32, u8)]) -> Option<
 
 /// Highest-priority heading source: a struct-tree node `H1`..`H6` directly
 /// tagging this line via its `mcid`. Available only for tagged PDFs.
-pub(super) fn struct_heading_level(line: &ProjectedLine, struct_nodes: &[StructNode]) -> Option<u8> {
+pub(super) fn struct_heading_level(
+    line: &ProjectedLine,
+    struct_nodes: &[StructNode],
+) -> Option<u8> {
     let mcid = line.mcid?;
     for node in struct_nodes {
         if !node.mcids.contains(&mcid) {

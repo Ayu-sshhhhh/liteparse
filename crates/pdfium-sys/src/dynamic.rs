@@ -259,8 +259,7 @@ pub struct PdfiumBindings {
     // -- Structure tree --
     pub FPDF_StructTree_GetForPage: unsafe extern "C" fn(FPDF_PAGE) -> FPDF_STRUCTTREE,
     pub FPDF_StructTree_Close: unsafe extern "C" fn(FPDF_STRUCTTREE),
-    pub FPDF_StructTree_CountChildren:
-        unsafe extern "C" fn(FPDF_STRUCTTREE) -> std::os::raw::c_int,
+    pub FPDF_StructTree_CountChildren: unsafe extern "C" fn(FPDF_STRUCTTREE) -> std::os::raw::c_int,
     pub FPDF_StructTree_GetChildAtIndex:
         unsafe extern "C" fn(FPDF_STRUCTTREE, std::os::raw::c_int) -> FPDF_STRUCTELEMENT,
     pub FPDF_StructElement_GetType: unsafe extern "C" fn(

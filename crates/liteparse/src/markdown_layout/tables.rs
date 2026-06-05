@@ -133,7 +133,10 @@ pub(super) fn split_cells(line: &ProjectedLine) -> Vec<TableCell> {
 ///
 /// Returns the patched cells if every short cell could be cleanly split to
 /// recover `tracks.len()` cells total; otherwise `None`.
-pub(super) fn recover_merged_cell(mut cells: Vec<TableCell>, tracks: &[f32]) -> Option<Vec<TableCell>> {
+pub(super) fn recover_merged_cell(
+    mut cells: Vec<TableCell>,
+    tracks: &[f32],
+) -> Option<Vec<TableCell>> {
     let target = tracks.len();
     if cells.len() >= target {
         return None;
@@ -337,7 +340,9 @@ fn match_track_idx(cell: &TableCell, track_ranges: &[(f32, f32)]) -> Option<usiz
         .enumerate()
         .filter(|(_, (s, _))| (cell.start_x - s).abs() <= tol)
         .min_by(|(_, (s1, _)), (_, (s2, _))| {
-            (cell.start_x - s1).abs().total_cmp(&(cell.start_x - s2).abs())
+            (cell.start_x - s1)
+                .abs()
+                .total_cmp(&(cell.start_x - s2).abs())
         })
     {
         return Some(i);
@@ -351,6 +356,374 @@ fn match_track_idx(cell: &TableCell, track_ranges: &[(f32, f32)]) -> Option<usiz
             (cell.end_x - e1).abs().total_cmp(&(cell.end_x - e2).abs())
         })
         .map(|(i, _)| i)
+}
+
+/// Maximum number of rows to walk forward when inferring tracks from raw
+/// item positions. 12 covers most real tables while bounding the cost.
+const TABLE_TRACK_INFERENCE_MAX_ROWS: usize = 12;
+
+/// Walk forward from `start_idx` collecting raw text-item start-x positions
+/// across all adjacent rows, then single-link cluster them at
+/// `TABLE_TRACK_TOLERANCE_PT`. Returns cluster centroids sorted ascending.
+///
+/// Unlike `split_cells`-derived tracks, this is immune to the
+/// `TABLE_CELL_GAP_FONT_MULTIPLIER` knife-edge that collapses tightly-kerned
+/// numeric columns into a single cell (e.g. `$448 $427 7%` at 14pt with
+/// 13.9pt inter-item gaps). It also surfaces tracks witnessed by even a
+/// single row when other rows in the same table have PDFium-level merged
+/// spans that hide the full column geometry.
+fn infer_tracks_from_raw_items(lines: &[ProjectedLine], start_idx: usize) -> Vec<f32> {
+    let mut xs: Vec<f32> = Vec::new();
+    let push_row_xs = |xs: &mut Vec<f32>, line: &ProjectedLine| {
+        let row_xs: Vec<f32> = line
+            .spans
+            .iter()
+            .filter(|s| !s.text.trim().is_empty())
+            .map(|s| s.x)
+            .collect();
+        // Skip 0- or 1-item rows — they don't carry column info and can
+        // introduce noise from single-cell prose lines.
+        if row_xs.len() >= 2 {
+            xs.extend(row_xs);
+        }
+    };
+    push_row_xs(&mut xs, &lines[start_idx]);
+    let mut j = start_idx + 1;
+    let mut rows_used = 1;
+    while j < lines.len() && rows_used < TABLE_TRACK_INFERENCE_MAX_ROWS {
+        if !table_rows_adjacent(&lines[j - 1], &lines[j]) {
+            break;
+        }
+        push_row_xs(&mut xs, &lines[j]);
+        j += 1;
+        rows_used += 1;
+    }
+    xs.sort_by(f32::total_cmp);
+    let mut clusters: Vec<f32> = Vec::new();
+    let mut current_sum = 0.0f32;
+    let mut current_count = 0usize;
+    let mut current_anchor = f32::NEG_INFINITY;
+    for &x in &xs {
+        if current_count == 0
+            || (x - current_anchor).abs() <= TABLE_TRACK_TOLERANCE_PT
+        {
+            current_sum += x;
+            current_count += 1;
+            current_anchor = current_sum / current_count as f32;
+        } else {
+            clusters.push(current_sum / current_count as f32);
+            current_sum = x;
+            current_count = 1;
+            current_anchor = x;
+        }
+    }
+    if current_count > 0 {
+        clusters.push(current_sum / current_count as f32);
+    }
+    clusters
+}
+
+/// Build a row's cells against a fixed set of column anchors. Each raw item
+/// is assigned to the track its x-extent covers; items that span multiple
+/// tracks (PDFium-level merged spans like `$1,298 $1,263 5%` at one anchor
+/// reaching past two more anchors) are split on internal whitespace at
+/// boundaries closest to each crossed anchor.
+///
+/// Returns `Some(cells)` of length `tracks.len()` (some cells may have empty
+/// text), or `None` if any item can't be assigned cleanly (out-of-band item,
+/// or a multi-track item with no usable whitespace boundary).
+fn cells_from_raw_items_with_tracks(
+    line: &ProjectedLine,
+    tracks: &[f32],
+) -> Option<Vec<TableCell>> {
+    let mut spans: Vec<&TextItem> = line
+        .spans
+        .iter()
+        .filter(|s| !s.text.trim().is_empty())
+        .collect();
+    spans.sort_by(|a, b| a.x.total_cmp(&b.x));
+    // Require ≥ 2 PDFium spans on the row. A 1-span row spanning multiple
+    // tracks is almost always prose (wrapped paragraph whose x-range
+    // happens to overlap the track region); shredding it at whitespace
+    // anchors corrupts the body text. Real merged-numeric table rows still
+    // have a label span and a values span (≥ 2).
+    if spans.len() < 2 {
+        return None;
+    }
+    // Reject rows that contain a span with implausibly narrow reported
+    // width-per-character (a known PDFium quirk on some encodings where the
+    // bbox shrinks but the text payload is full-length). Without this, the
+    // narrow x-range tricks track inference into treating the next visible
+    // span as a "second column", manufacturing a fake table from prose.
+    // Real text averages 4-10pt/char at common font sizes; 2pt/char is a
+    // generous lower bound that only flags genuinely degenerate widths.
+    let tol = TABLE_TRACK_TOLERANCE_PT;
+    let mut cells: Vec<TableCell> = tracks
+        .iter()
+        .map(|&t| TableCell {
+            start_x: t,
+            end_x: t,
+            text: String::new(),
+            bold: false,
+        })
+        .collect();
+    let push_text = |dst: &mut String, src: &str| {
+        let src = src.trim();
+        if src.is_empty() {
+            return;
+        }
+        if !dst.is_empty() && !dst.ends_with(' ') {
+            dst.push(' ');
+        }
+        dst.push_str(src);
+    };
+    for span in &spans {
+        let x0 = span.x;
+        let x1 = span.x + span.width.max(0.0);
+        let covered: Vec<usize> = tracks
+            .iter()
+            .enumerate()
+            .filter(|&(_, &t)| t >= x0 - tol && t <= x1 + tol)
+            .map(|(i, _)| i)
+            .collect();
+        // For spans that cover multiple tracks (multi-column-spanning items
+        // we'd want to split), the span's leftmost x must anchor at the
+        // leftmost covered track within tolerance. Otherwise the item is
+        // non-tabular content (a wrapped paragraph / footnote whose x-range
+        // merely happens to overlap the track region) that we shouldn't
+        // shred at whitespace boundaries.
+        if covered.len() > 1 {
+            let left_track = tracks[covered[0]];
+            if (x0 - left_track).abs() > tol {
+                return None;
+            }
+        }
+        match covered.len() {
+            0 => return None,
+            1 => {
+                let idx = covered[0];
+                push_text(&mut cells[idx].text, &span.text);
+                cells[idx].end_x = cells[idx].end_x.max(x1);
+                if is_bold_span(span) {
+                    cells[idx].bold = true;
+                }
+            }
+            _ => {
+                let pieces = split_span_at_anchors(span, &covered, tracks)?;
+                let bold = is_bold_span(span);
+                for (idx, piece) in covered.iter().zip(pieces.iter()) {
+                    if piece.is_empty() {
+                        return None;
+                    }
+                    push_text(&mut cells[*idx].text, piece);
+                    if bold {
+                        cells[*idx].bold = true;
+                    }
+                }
+            }
+        }
+    }
+    for cell in &mut cells {
+        cell.text = collapse_whitespace(cell.text.trim());
+    }
+    Some(cells)
+}
+
+/// Split a multi-track-spanning span's text into one piece per covered track
+/// by picking whitespace positions whose linearly-interpolated x is closest
+/// to each subsequent anchor. Returns `Some(pieces)` of length
+/// `covered.len()` when every split lands on a real whitespace boundary;
+/// `None` if no usable boundary exists (e.g. unbroken text like a long
+/// hex string).
+fn split_span_at_anchors(
+    span: &TextItem,
+    covered: &[usize],
+    tracks: &[f32],
+) -> Option<Vec<String>> {
+    let chars: Vec<char> = span.text.chars().collect();
+    let n = chars.len();
+    if n == 0 || covered.len() < 2 {
+        return None;
+    }
+    let span_x0 = span.x;
+    let span_w = span.width.max(1.0);
+    let mut split_indices: Vec<usize> = Vec::new();
+    for &idx in covered.iter().skip(1) {
+        let target = tracks[idx];
+        let mut best: Option<(usize, f32)> = None;
+        for (k, ch) in chars.iter().enumerate() {
+            if !ch.is_whitespace() {
+                continue;
+            }
+            if split_indices.contains(&k) {
+                continue;
+            }
+            let frac = k as f32 / n as f32;
+            let x = span_x0 + frac * span_w;
+            let d = (x - target).abs();
+            if best.as_ref().is_none_or(|b| d < b.1) {
+                best = Some((k, d));
+            }
+        }
+        let (k, _) = best?;
+        split_indices.push(k);
+    }
+    split_indices.sort();
+    let mut pieces: Vec<String> = Vec::new();
+    let mut prev = 0usize;
+    for k in &split_indices {
+        let piece: String = chars[prev..*k]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_string();
+        pieces.push(piece);
+        prev = *k;
+    }
+    pieces.push(chars[prev..].iter().collect::<String>().trim().to_string());
+    if pieces.len() != covered.len() {
+        return None;
+    }
+    Some(pieces)
+}
+
+/// Like `try_detect_table` but seeds column tracks from the union of raw
+/// item start-x positions across the candidate window rather than from the
+/// first row's `split_cells` output. Use this first to unlock tables where
+/// the cell-gap heuristic collapses adjacent numeric columns into one cell
+/// in every row. Returns `None` when (a) inferred tracks are no richer than
+/// per-row bucketing (no win to be had), or (b) the inferred-track candidate
+/// fails any soundness check — in which case `try_detect_table`'s existing
+/// logic should run.
+fn try_detect_table_inferred(
+    lines: &[ProjectedLine],
+    start_idx: usize,
+    floor: usize,
+) -> Option<TableRun> {
+    let baseline_cells = split_cells(&lines[start_idx]);
+    let tracks = infer_tracks_from_raw_items(lines, start_idx);
+    if tracks.len() < TABLE_MIN_COLUMNS {
+        return None;
+    }
+    // Only bother if we'd actually unlock more columns than the default path.
+    if tracks.len() <= baseline_cells.len() {
+        return None;
+    }
+    // Reject "tracks" that are really inter-word positions in prose. Real
+    // table columns are separated by visible whitespace gutters wider than
+    // the body font; word positions in running prose cluster at < 1× font
+    // size apart. Threshold at 1.5× the seed line's dominant font size, with
+    // a 12pt absolute floor for small fonts.
+    let font_size = if lines[start_idx].dominant_font_size > 0.0 {
+        lines[start_idx].dominant_font_size
+    } else {
+        lines[start_idx].bbox.height.max(1.0)
+    };
+    let min_track_gap = (font_size * 1.5).max(12.0);
+    let min_gap = tracks
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .fold(f32::INFINITY, f32::min);
+    if min_gap < min_track_gap {
+        return None;
+    }
+    let column_count = tracks.len();
+    let track_ranges: Vec<(f32, f32)> = tracks.iter().map(|&t| (t, t)).collect();
+    let tracks_right_edge = *tracks.last().unwrap() + TABLE_TRACK_TOLERANCE_PT.max(8.0);
+
+    // Seed row: require a strong structural signal — its raw PDFium span
+    // count must be ≥ tracks.len() AND each span must single-cover (no
+    // multi-track splits in the seeding row). This rejects prose lines
+    // where 2-3 spans happen to anchor at inferred tracks but actually
+    // each span's x-extent covers multiple tracks, which would produce a
+    // shred-on-whitespace seed that's indistinguishable from a real
+    // table. Subsequent rows can still have merged spans recovered via
+    // the multi-cover split path.
+    let seed_spans: Vec<&TextItem> = lines[start_idx]
+        .spans
+        .iter()
+        .filter(|s| !s.text.trim().is_empty())
+        .collect();
+    if seed_spans.len() < tracks.len() {
+        return None;
+    }
+    let tol = TABLE_TRACK_TOLERANCE_PT;
+    for s in &seed_spans {
+        let x0 = s.x;
+        let x1 = s.x + s.width.max(0.0);
+        let covered = tracks
+            .iter()
+            .filter(|&&t| t >= x0 - tol && t <= x1 + tol)
+            .count();
+        if covered > 1 {
+            return None;
+        }
+    }
+    let first = cells_from_raw_items_with_tracks(&lines[start_idx], &tracks)?;
+    if first.iter().filter(|c| !c.text.is_empty()).count() < TABLE_MIN_COLUMNS {
+        return None;
+    }
+    let mut rows: Vec<(usize, &ProjectedLine, Vec<TableCell>)> =
+        vec![(start_idx, &lines[start_idx], first)];
+
+    let mut j = start_idx + 1;
+    while j < lines.len() {
+        if lines[j].bbox.x > tracks_right_edge {
+            j += 1;
+            continue;
+        }
+        if !table_rows_adjacent(rows.last().unwrap().1, &lines[j]) {
+            break;
+        }
+        let Some(cells) = cells_from_raw_items_with_tracks(&lines[j], &tracks) else {
+            break;
+        };
+        // Drop rows that contribute zero populated cells (all out-of-band
+        // or empty after splitting) — they'd add noise without content.
+        if cells.iter().all(|c| c.text.is_empty()) {
+            break;
+        }
+        rows.push((j, &lines[j], cells));
+        j += 1;
+    }
+    if rows.len() < TABLE_MIN_ROWS {
+        return None;
+    }
+    let cv = row_spacing_cv(&rows);
+    if cv > TABLE_ROW_SPACING_MAX_CV {
+        // Defer to the existing path, which can fall back to GridFallback.
+        return None;
+    }
+    let end = j;
+
+    let absorbed = absorb_header_lines(lines, start_idx, &track_ranges, column_count, floor);
+    let first_row = &rows[0].2;
+    let bold_header_qualifies =
+        absorbed.is_none() && first_row.iter().all(|c| c.bold && !c.text.is_empty());
+    let (run_start, header, row_start) = match absorbed {
+        Some((hstart, header_texts)) => (hstart, Some(header_texts), 0),
+        None if bold_header_qualifies => (
+            start_idx,
+            Some(first_row.iter().map(|c| c.text.clone()).collect()),
+            1,
+        ),
+        None => (start_idx, None, 0),
+    };
+    let body_rows: Vec<Vec<String>> = rows[row_start..]
+        .iter()
+        .map(|(_, _, cells)| cells.iter().map(|c| c.text.clone()).collect())
+        .collect();
+    if header.is_none() && body_rows.len() < TABLE_MIN_ROWS {
+        return None;
+    }
+    Some(TableRun {
+        start: run_start,
+        end,
+        block: Block::Table {
+            header,
+            rows: body_rows,
+        },
+    })
 }
 
 /// Try to extend a candidate table starting at `start_idx`. On success returns
@@ -367,8 +740,7 @@ fn try_detect_table(lines: &[ProjectedLine], start_idx: usize, floor: usize) -> 
         vec![(start_idx, &lines[start_idx], first_cells.clone())];
     let column_count = first_cells.len();
     let tracks: Vec<f32> = first_cells.iter().map(|c| c.start_x).collect();
-    let track_ranges: Vec<(f32, f32)> =
-        first_cells.iter().map(|c| (c.start_x, c.end_x)).collect();
+    let track_ranges: Vec<(f32, f32)> = first_cells.iter().map(|c| (c.start_x, c.end_x)).collect();
 
     // Right edge of the established column tracks (last track + a track-width
     // worth of slack). Used to identify lines that sit entirely in a different
@@ -637,7 +1009,11 @@ pub(super) fn detect_tables(lines: &[ProjectedLine]) -> Vec<TableRun> {
     let mut i = 0;
     let mut floor = 0;
     while i < lines.len() {
-        if let Some(run) = try_detect_table(lines, i, floor) {
+        if let Some(run) = try_detect_table_inferred(lines, i, floor) {
+            floor = run.end;
+            i = run.end;
+            out.push(run);
+        } else if let Some(run) = try_detect_table(lines, i, floor) {
             floor = run.end;
             i = run.end;
             out.push(run);
@@ -727,7 +1103,10 @@ fn is_page_ref(text: &str) -> bool {
         return true;
     }
     let lower = t.to_ascii_lowercase();
-    if lower.chars().all(|c| matches!(c, 'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm')) {
+    if lower
+        .chars()
+        .all(|c| matches!(c, 'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'))
+    {
         // Cap length so multi-word lowercase Latin words don't pass (e.g.
         // "mix", "civil" would all be made of roman-numeral letters).
         if t.chars().count() <= 6 {
@@ -745,7 +1124,21 @@ fn is_bullet_only(text: &str) -> bool {
     let only_glyph = t.chars().all(|c| {
         matches!(
             c,
-            '•' | '●' | '○' | '◦' | '▪' | '■' | '□' | '‣' | '⁃' | '*' | '-' | '–' | '—' | '⮚' | '►' | '▶'
+            '•' | '●'
+                | '○'
+                | '◦'
+                | '▪'
+                | '■'
+                | '□'
+                | '‣'
+                | '⁃'
+                | '*'
+                | '-'
+                | '–'
+                | '—'
+                | '⮚'
+                | '►'
+                | '▶'
         )
     });
     if only_glyph {
@@ -765,7 +1158,9 @@ fn is_bullet_only(text: &str) -> bool {
         let body: String = chars[..chars.len() - 1].iter().collect();
         if !body.is_empty()
             && (body.chars().all(|c| c.is_ascii_digit())
-                || body.chars().all(|c| matches!(c, 'i' | 'v' | 'x' | 'I' | 'V' | 'X')))
+                || body
+                    .chars()
+                    .all(|c| matches!(c, 'i' | 'v' | 'x' | 'I' | 'V' | 'X')))
         {
             return true;
         }
@@ -806,11 +1201,8 @@ fn try_detect_description_list(lines: &[ProjectedLine], start_idx: usize) -> Opt
         return None;
     }
 
-    let mut rows: Vec<(usize, String, String)> = vec![(
-        start_idx,
-        first[0].text.clone(),
-        first[1].text.clone(),
-    )];
+    let mut rows: Vec<(usize, String, String)> =
+        vec![(start_idx, first[0].text.clone(), first[1].text.clone())];
     // Track how many rows came from the *actual* 2-cell path (i.e. PDFium
     // emitted two distinct spans with a clear gap). The merged-span split path
     // is a recovery hack for tight-kerning cases — when it's the only thing
@@ -842,9 +1234,7 @@ fn try_detect_description_list(lines: &[ProjectedLine], start_idx: usize) -> Opt
                 .windows(2)
                 .map(|w| lines[w[1].0].bbox.y - lines[w[0].0].bbox.y)
                 .collect();
-            if let Some(&max_prior) = prior_gaps
-                .iter()
-                .max_by(|a, b| a.total_cmp(b))
+            if let Some(&max_prior) = prior_gaps.iter().max_by(|a, b| a.total_cmp(b))
                 && cur_gap > max_prior * 1.6
                 && cur_gap > lines[j].bbox.height.max(prev_line.bbox.height)
             {
@@ -878,8 +1268,7 @@ fn try_detect_description_list(lines: &[ProjectedLine], start_idx: usize) -> Opt
                 }
                 // Merged-span row: single cell starts at col 0 but extends past
                 // col 1's anchor. Split on the whitespace closest to col 1.
-                let straddles =
-                    c0_aligned && cell.end_x > col1_x + DESC_LIST_TRACK_TOL_PT;
+                let straddles = c0_aligned && cell.end_x > col1_x + DESC_LIST_TRACK_TOL_PT;
                 if straddles {
                     if let Some((left, right)) =
                         split_merged_at_anchor(&cell.text, cell.start_x, cell.end_x, col1_x)
@@ -923,9 +1312,7 @@ fn try_detect_description_list(lines: &[ProjectedLine], start_idx: usize) -> Opt
     // (digits or roman numerals), the run is a TOC. TOCs match the alpha
     // pair check only when one of the page refs happens to be a roman
     // numeral like "v" or "vi" alongside an alpha col 0.
-    let all_page_refs = rows
-        .iter()
-        .all(|(_, _, c1)| is_page_ref(c1));
+    let all_page_refs = rows.iter().all(|(_, _, c1)| is_page_ref(c1));
     if all_page_refs {
         return None;
     }
@@ -1030,10 +1417,7 @@ const TABLE_HEADER_MAX_ABSORB_ROWS: usize = 3;
 /// distinct tables.
 const TABLE_MERGE_MAX_Y_GAP_LINES: f32 = 2.0;
 
-fn merge_consecutive_table_runs(
-    runs: Vec<TableRun>,
-    lines: &[ProjectedLine],
-) -> Vec<TableRun> {
+fn merge_consecutive_table_runs(runs: Vec<TableRun>, lines: &[ProjectedLine]) -> Vec<TableRun> {
     if runs.len() < 2 {
         return runs;
     }
@@ -1116,11 +1500,7 @@ fn subset_match_score(ta: (f32, f32), tb: (f32, f32), tol: f32) -> Option<f32> {
         f32::INFINITY
     };
     let d = d_start.min(d_end).min(d_center);
-    if d <= tol {
-        Some(d)
-    } else {
-        None
-    }
+    if d <= tol { Some(d) } else { None }
 }
 
 /// Looser tolerance for cross-run subset matching. Header cells and body
@@ -1250,10 +1630,8 @@ fn try_merge_pair(a: &TableRun, b: &TableRun, lines: &[ProjectedLine]) -> Option
     // Case Same: identical tracks, concat rows.
     if a_cols == b_cols && tracks_align_same(&a_tracks, &b_tracks) {
         // Don't merge two complete-looking tables across a noticeable gap.
-        let both_complete = a_header.is_some()
-            && b_header.is_some()
-            && a_rows.len() >= 3
-            && b_rows.len() >= 3;
+        let both_complete =
+            a_header.is_some() && b_header.is_some() && a_rows.len() >= 3 && b_rows.len() >= 3;
         if both_complete && gap > line_height * 1.0 {
             return None;
         }
@@ -1807,15 +2185,14 @@ fn build_ruled_table(
         // row-0 signal misleads. Col-0 label columns are the much stronger
         // fill-in-form signature: rare in body prose, near-universal in
         // forms.
-        let col0_fill =
-            (0..n_rows).filter(|r| cell_has_text[*r][0]).count() as f32 / n_rows as f32;
+        let col0_fill = (0..n_rows).filter(|r| cell_has_text[*r][0]).count() as f32 / n_rows as f32;
         let col0_max_chars = (0..n_rows)
             .filter(|r| cell_has_text[*r][0])
             .map(|r| cells[r][0].len())
             .max()
             .unwrap_or(0);
-        let col0_spine = col0_fill >= TABLE_SPINE_FILL_FRACTION
-            && col0_max_chars <= TABLE_SPINE_MAX_CELL_CHARS;
+        let col0_spine =
+            col0_fill >= TABLE_SPINE_FILL_FRACTION && col0_max_chars <= TABLE_SPINE_MAX_CELL_CHARS;
         if !col0_spine || empty_frac > TABLE_MAX_EMPTY_CELL_FRACTION_WITH_SPINE {
             return None;
         }
@@ -1968,7 +2345,10 @@ pub(super) fn detect_ruled_tables(
 /// Merge ruled-grid runs with borderless runs into a single sorted list. When
 /// ranges overlap the ruled run wins (path-based geometry is strictly stronger
 /// than text-alignment heuristics) — overlapping borderless runs are dropped.
-pub(super) fn merge_table_runs(mut ruled: Vec<TableRun>, borderless: Vec<TableRun>) -> Vec<TableRun> {
+pub(super) fn merge_table_runs(
+    mut ruled: Vec<TableRun>,
+    borderless: Vec<TableRun>,
+) -> Vec<TableRun> {
     // A ruled run normally beats an overlapping borderless run (path geometry
     // is a stronger signal than text alignment). But a 1-column ruled run is
     // ambiguous — it can come from a real single-column table (doc 149's
@@ -1993,9 +2373,7 @@ pub(super) fn merge_table_runs(mut ruled: Vec<TableRun>, borderless: Vec<TableRu
         kept.push(r);
     }
     for b in borderless {
-        let overlaps = kept
-            .iter()
-            .any(|r| !(b.end <= r.start || b.start >= r.end));
+        let overlaps = kept.iter().any(|r| !(b.end <= r.start || b.start >= r.end));
         if !overlaps {
             kept.push(b);
         }
@@ -2125,7 +2503,10 @@ mod tests {
         match &run.block {
             Block::Table { header, rows } => {
                 let header = header.as_ref().expect("header should be present");
-                assert_eq!(header, &vec!["Name".to_string(), "Scores".to_string(), String::new()]);
+                assert_eq!(
+                    header,
+                    &vec!["Name".to_string(), "Scores".to_string(), String::new()]
+                );
                 // All three body rows survive — the header came from above, so
                 // rows[0] is not consumed as a header.
                 assert_eq!(rows.len(), 3);
@@ -2134,7 +2515,7 @@ mod tests {
         }
     }
 
-#[test]
+    #[test]
     fn does_not_absorb_single_cell_title_above_body() {
         // A one-cell title/caption above a table is NOT a header row and must
         // not be absorbed.
@@ -2146,7 +2527,10 @@ mod tests {
         ];
         let runs = detect_tables(&lines);
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].start, 1, "single-cell title must stay out of the run");
+        assert_eq!(
+            runs[0].start, 1,
+            "single-cell title must stay out of the run"
+        );
     }
 
     #[test]
@@ -2326,7 +2710,12 @@ mod tests {
 
     fn four_col_line(label: &str, y: f32) -> ProjectedLine {
         line_with_spans(
-            &[(label, 50.0), (label, 150.0), (label, 250.0), (label, 350.0)],
+            &[
+                (label, 50.0),
+                (label, 150.0),
+                (label, 250.0),
+                (label, 350.0),
+            ],
             y,
             10.0,
         )
@@ -2591,7 +2980,12 @@ mod tests {
             three_col_line("h", 10.0),
             three_col_line("h", 25.0),
             line_with_spans(
-                &[("This", 50.0), ("is", 150.0), ("real", 250.0), ("content", 350.0)],
+                &[
+                    ("This", 50.0),
+                    ("is", 150.0),
+                    ("real", 250.0),
+                    ("content", 350.0),
+                ],
                 40.0,
                 10.0,
             ),

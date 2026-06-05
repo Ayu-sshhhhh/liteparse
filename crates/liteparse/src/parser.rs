@@ -110,10 +110,7 @@ impl LiteParse {
         // The Document handle isn't Send, so we open it, pull every bit of
         // document-level state we need, and drop it before any `.await`.
         let password = self.config.password.as_deref();
-        let render_images = matches!(
-            self.config.image_mode,
-            crate::config::ImageMode::Embed
-        );
+        let render_images = matches!(self.config.image_mode, crate::config::ImageMode::Embed);
         let (pages, ocr_rendered, outline, images) = {
             let document = extract::load_document_from_input(&validated_input, password)?;
             let outline = extract::extract_outline(&document);

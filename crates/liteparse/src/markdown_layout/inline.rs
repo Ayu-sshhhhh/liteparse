@@ -190,7 +190,11 @@ pub(super) fn strip_leading_marker_from_inline(s: &str, marker: &str) -> Option<
 /// Append an inline-rendered continuation line to an existing list-item body.
 /// De-hyphenates against the raw text boundary (mirrors the paragraph rule)
 /// and falls back to a space join otherwise.
-pub(super) fn append_inline_continuation(prev_text: &mut String, next_raw: &str, next_inline: &str) {
+pub(super) fn append_inline_continuation(
+    prev_text: &mut String,
+    next_raw: &str,
+    next_inline: &str,
+) {
     let next_raw = collapse_whitespace(next_raw);
     if next_raw.is_empty() {
         return;

@@ -151,8 +151,7 @@ pub(super) fn matches_chrome_pattern(text: &str) -> bool {
     }
 
     // Copyright / trademark chrome.
-    if t.contains('©') || lower.contains("copyright ") || lower.contains("all rights reserved")
-    {
+    if t.contains('©') || lower.contains("copyright ") || lower.contains("all rights reserved") {
         return true;
     }
 
@@ -203,8 +202,7 @@ fn has_year(lower: &str) -> bool {
         if !starts_word {
             continue;
         }
-        if (bytes[i] == b'1' && bytes[i + 1] == b'9')
-            || (bytes[i] == b'2' && bytes[i + 1] == b'0')
+        if (bytes[i] == b'1' && bytes[i + 1] == b'9') || (bytes[i] == b'2' && bytes[i + 1] == b'0')
         {
             if bytes[i + 2].is_ascii_digit() && bytes[i + 3].is_ascii_digit() {
                 let ends_word = i + 4 >= bytes.len() || !bytes[i + 4].is_ascii_alphanumeric();
@@ -316,9 +314,7 @@ pub fn detect_single_page_chrome(
                 .iter()
                 .enumerate()
                 .filter(|(j, l)| {
-                    *j != idx
-                        && tops[*j] > bots[idx]
-                        && !matches_chrome_pattern(l.text.trim())
+                    *j != idx && tops[*j] > bots[idx] && !matches_chrome_pattern(l.text.trim())
                 })
                 .map(|(j, _)| tops[j] - bots[idx])
                 .min_by(|a, b| a.partial_cmp(b).unwrap())
@@ -329,9 +325,7 @@ pub fn detect_single_page_chrome(
                 .iter()
                 .enumerate()
                 .filter(|(j, l)| {
-                    *j != idx
-                        && bots[*j] < tops[idx]
-                        && !matches_chrome_pattern(l.text.trim())
+                    *j != idx && bots[*j] < tops[idx] && !matches_chrome_pattern(l.text.trim())
                 })
                 .map(|(j, _)| tops[idx] - bots[j])
                 .min_by(|a, b| a.partial_cmp(b).unwrap())
@@ -445,7 +439,9 @@ mod tests {
     fn chrome_pattern_recognizes_common_signatures() {
         assert!(matches_chrome_pattern("http://example.com/foo"));
         assert!(matches_chrome_pattern("www.nature.com/scientificreports/"));
-        assert!(matches_chrome_pattern("Please cite this article in press as: ..."));
+        assert!(matches_chrome_pattern(
+            "Please cite this article in press as: ..."
+        ));
         assert!(matches_chrome_pattern("Page 12 of 24"));
         assert!(matches_chrome_pattern("9"));
         assert!(matches_chrome_pattern("© 2023 Acme Corp"));
@@ -466,13 +462,7 @@ mod tests {
         // 792pt page; top band = 0..118pt.
         let lines = vec![
             // Chrome line at y=20 (in top band)
-            line(
-                "www.nature.com/scientificreports/",
-                50.0,
-                20.0,
-                10.0,
-                10.0,
-            ),
+            line("www.nature.com/scientificreports/", 50.0, 20.0, 10.0, 10.0),
             // Body title well below chrome (clear gap)
             line("Main Body Title", 50.0, 200.0, 14.0, 14.0),
             line("Body prose line one.", 50.0, 220.0, 10.0, 10.0),

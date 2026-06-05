@@ -45,7 +45,12 @@ impl Document {
     /// document has no outline.
     pub fn outline(&self) -> Vec<OutlineEntry> {
         let mut out = Vec::new();
-        let root = unsafe { ffi!(FPDFBookmark_GetFirstChild(self.handle, std::ptr::null_mut())) };
+        let root = unsafe {
+            ffi!(FPDFBookmark_GetFirstChild(
+                self.handle,
+                std::ptr::null_mut()
+            ))
+        };
         if !root.is_null() {
             self.walk_bookmark(root, 1, &mut out);
         }
@@ -80,8 +85,7 @@ impl Document {
 }
 
 fn read_bookmark_title(bookmark: pdfium_sys::FPDF_BOOKMARK) -> String {
-    let needed =
-        unsafe { ffi!(FPDFBookmark_GetTitle(bookmark, std::ptr::null_mut(), 0)) } as usize;
+    let needed = unsafe { ffi!(FPDFBookmark_GetTitle(bookmark, std::ptr::null_mut(), 0)) } as usize;
     if needed < 2 {
         return String::new();
     }
@@ -121,7 +125,11 @@ fn resolve_dest(
         return (None, None);
     }
     let page_index = unsafe { ffi!(FPDFDest_GetDestPageIndex(doc, dest)) };
-    let page_index = if page_index >= 0 { Some(page_index) } else { None };
+    let page_index = if page_index >= 0 {
+        Some(page_index)
+    } else {
+        None
+    };
 
     let mut has_x: pdfium_sys::FPDF_BOOL = 0;
     let mut has_y: pdfium_sys::FPDF_BOOL = 0;
