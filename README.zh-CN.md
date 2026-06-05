@@ -20,7 +20,7 @@
 
 > 在找 LiteParse V1？请访问 [旧版代码仓库](https://github.com/run-llama/liteparse/tree/logan/liteparse-v1)。
 
-LiteParse 是一款独立的开源 PDF 解析工具，专注于**快速、轻量**的文档解析。它能输出高质量的、带有边界框（bounding box）的空间文本信息，无需依赖任何闭源大模型或云端服务，所有处理都在本地完成。
+LiteParse 是一款独立的开源 PDF 解析工具，专注于**快速、轻量**的文档解析。它能输出高质量的、带有标注（bounding box）的空间文本信息，无需依赖任何闭源大模型或云端服务，所有处理都在本地完成。
 
 **本地解析能力不够用？**
 对于复杂文档（密集表格、多栏布局、图表、手写文字或扫描版 PDF），我们的云端文档解析工具 [LlamaParse](https://developers.llamaindex.ai/python/cloud/llamaparse/?utm_source=github&utm_medium=liteparse) 能给出明显更好的结果。它专为生产级文档处理流水线设计，会替你搞定那些棘手的情况，让模型直接拿到干净、结构化的数据和 markdown。
