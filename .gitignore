@@ -2,7 +2,6 @@
 node_modules/
 pnpm-lock.yaml
 
-
 # Build output
 dist/
 dist-browser-compat/
@@ -43,6 +42,7 @@ tmp/
 temp/
 *.txt
 *.png
+*.jpeg
 !integration_tests_data/receipt.png
 !integration_tests_data/sample3.docx.doc
 !integration_tests_data/sample.pdf
